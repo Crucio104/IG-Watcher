@@ -203,10 +203,15 @@ public struct DashboardView: View {
                                     .scaledToFill()
                                     .frame(width: 38, height: 38)
                                     .clipShape(Circle())
+                            case .empty:
+                                ProgressView()
+                                    .scaleEffect(0.6)
+                                    .frame(width: 38, height: 38)
                             default:
                                 fallbackAvatar
                             }
                         }
+                        .id(picURL)
                     } else {
                         fallbackAvatar
                     }
@@ -304,6 +309,27 @@ public struct DashboardView: View {
         guard let session = sessionManager.currentSession else { return }
         let knownUsername = sessionManager.currentUserProfile?.username ?? UserDefaults.standard.string(forKey: "com.instagramwatcher.cached_username")
         Task {
+            // Tentativo 0: Se l'username è noto ma manca l'avatar, risolviamo direttamente tramite la pagina profilo
+            if let uname = knownUsername, !uname.isEmpty {
+                let candidate = InstagramUser(id: session.userID, username: uname)
+                let resolved = await AnonymousMediaService.shared.resolveProfile(user: candidate, session: session)
+                if let pic = resolved.profilePicURL {
+                    let updatedUser = InstagramUser(
+                        id: resolved.id.isEmpty ? session.userID : resolved.id,
+                        username: resolved.username.isEmpty ? uname : resolved.username,
+                        fullName: resolved.fullName.isEmpty ? (sessionManager.currentUserProfile?.fullName ?? "") : resolved.fullName,
+                        profilePicURL: pic,
+                        isVerified: resolved.isVerified,
+                        isPrivate: resolved.isPrivate,
+                        mediaCount: resolved.postsCount
+                    )
+                    await MainActor.run {
+                        sessionManager.updateUserProfile(updatedUser)
+                    }
+                    return
+                }
+            }
+
             // Tentativo 1: API Ufficiale (web_profile_info o accounts/current_user)
             if let profile = try? await InstagramAPIService.shared.fetchCurrentUserProfile(session: session, username: knownUsername) {
                 await MainActor.run {
@@ -312,7 +338,27 @@ public struct DashboardView: View {
                 if profile.profilePicURL != nil {
                     return
                 }
+                // Se abbiamo ottenuto l'username ma non l'avatar, risolvilo tramite la pagina profilo
+                if !profile.username.isEmpty {
+                    let resolved = await AnonymousMediaService.shared.resolveProfile(user: profile, session: session)
+                    if let pic = resolved.profilePicURL {
+                        let fullUser = InstagramUser(
+                            id: profile.id,
+                            username: profile.username,
+                            fullName: resolved.fullName.isEmpty ? profile.fullName : resolved.fullName,
+                            profilePicURL: pic,
+                            isVerified: profile.isVerified || resolved.isVerified,
+                            isPrivate: profile.isPrivate,
+                            mediaCount: resolved.postsCount
+                        )
+                        await MainActor.run {
+                            sessionManager.updateUserProfile(fullUser)
+                        }
+                        return
+                    }
+                }
             }
+
             // Tentativo 2: WebKit autenticato con credenziali live
             if let jsonString = await InstagramWebBridge.shared.fetchCurrentUserProfile(userID: session.userID, username: knownUsername),
                let data = jsonString.data(using: .utf8),
@@ -337,6 +383,23 @@ public struct DashboardView: View {
                         sessionManager.updateUserProfile(user)
                     }
                     if picURL != nil {
+                        return
+                    }
+                    // Risolvi avatar tramite navigazione profilo
+                    let resolved = await AnonymousMediaService.shared.resolveProfile(user: user, session: session)
+                    if let pic = resolved.profilePicURL {
+                        let fullUser = InstagramUser(
+                            id: session.userID,
+                            username: uname,
+                            fullName: resolved.fullName.isEmpty ? fullName : resolved.fullName,
+                            profilePicURL: pic,
+                            isVerified: isVerified || resolved.isVerified,
+                            isPrivate: resolved.isPrivate,
+                            mediaCount: resolved.postsCount
+                        )
+                        await MainActor.run {
+                            sessionManager.updateUserProfile(fullUser)
+                        }
                         return
                     }
                 }

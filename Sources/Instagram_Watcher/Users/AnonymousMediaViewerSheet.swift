@@ -775,8 +775,13 @@ public struct AnonymousMediaViewerSheet: View {
             session: session
         )
 
+        let totalExpected = profile?.postsCount ?? user.mediaCount ?? 0
         if newItems.isEmpty {
-            canLoadMorePosts = false
+            if totalExpected > 0 && posts.count >= totalExpected {
+                canLoadMorePosts = false
+            } else if totalExpected == 0 && !posts.isEmpty {
+                canLoadMorePosts = false
+            }
         } else {
             var existingSet = Set(self.posts.map { $0.id })
             var toAdd: [InstagramPostItem] = []
@@ -787,10 +792,15 @@ public struct AnonymousMediaViewerSheet: View {
                 }
             }
             if toAdd.isEmpty {
-                canLoadMorePosts = false
+                if totalExpected > 0 && posts.count >= totalExpected {
+                    canLoadMorePosts = false
+                }
             } else {
                 withAnimation {
                     self.posts.append(contentsOf: toAdd)
+                }
+                if totalExpected > 0 && self.posts.count >= totalExpected {
+                    canLoadMorePosts = false
                 }
             }
         }

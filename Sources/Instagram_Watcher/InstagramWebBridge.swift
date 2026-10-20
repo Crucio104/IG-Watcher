@@ -66,6 +66,19 @@ public final class InstagramWebBridge: NSObject, WKNavigationDelegate {
         }
     }
 
+    /// Naviga in modo affidabile verso il profilo desiderato se non già posizionato
+    private func navigateToTargetProfile(_ wv: WKWebView, username: String) async {
+        let clean = username.trimmingCharacters(in: .whitespacesAndNewlines).replacingOccurrences(of: "@", with: "")
+        guard !clean.isEmpty, let targetURL = URL(string: "https://www.instagram.com/\(clean)/") else { return }
+        let currentPath = wv.url?.path.lowercased().trimmingCharacters(in: CharacterSet(charactersIn: "/")) ?? ""
+        if currentPath != clean.lowercased() {
+            wv.load(URLRequest(url: targetURL))
+            try? await Task.sleep(nanoseconds: 250_000_000)
+            await waitForWebViewReady(wv, timeout: 5.0)
+            try? await Task.sleep(nanoseconds: 300_000_000)
+        }
+    }
+
     // MARK: - Fetching Profilo e Post con Navigazione Diretta
 
     /// Recupera il profilo e/o i post navigando o interrogando in-page direttamente le API WebKit
@@ -85,14 +98,7 @@ public final class InstagramWebBridge: NSObject, WKNavigationDelegate {
         }
 
         // 2. Se non ha ancora risposto, naviga sul profilo utente con attesa garantita di caricamento
-        guard let targetURL = URL(string: "https://www.instagram.com/\(clean)/") else { return nil }
-        let currentPath = wv.url?.path.lowercased().trimmingCharacters(in: CharacterSet(charactersIn: "/")) ?? ""
-        if currentPath != clean.lowercased() {
-            wv.load(URLRequest(url: targetURL))
-            try? await Task.sleep(nanoseconds: 250_000_000)
-            await waitForWebViewReady(wv, timeout: 5.0)
-            try? await Task.sleep(nanoseconds: 300_000_000)
-        }
+        await navigateToTargetProfile(wv, username: clean)
 
         // 3. Riprova fetch in-page con il context della pagina del profilo utente
         if let direct = await executeInPageFetch(wv, username: clean, userID: userID) {
@@ -573,9 +579,24 @@ public final class InstagramWebBridge: NSObject, WKNavigationDelegate {
     }
 
     /// Scorri verso il basso nella pagina del profilo per caricare i post precedenti (infinite scroll)
-    public func fetchMorePosts(username: String, existingShortcodes: [String]) async -> String? {
+    public func fetchMorePosts(
+        username: String,
+        existingShortcodes: [String],
+        cursor: String? = nil,
+        userID: String? = nil
+    ) async -> String? {
         prepare()
         guard let wv = webView else { return nil }
+
+        let clean = username.trimmingCharacters(in: .whitespacesAndNewlines).replacingOccurrences(of: "@", with: "")
+        if !clean.isEmpty {
+            let currentPath = wv.url?.path.lowercased().trimmingCharacters(in: CharacterSet(charactersIn: "/")) ?? ""
+            if currentPath != clean.lowercased() {
+                await navigateToTargetProfile(wv, username: clean)
+            }
+        }
+
+        let effectiveCSRF = InstagramSessionManager.shared.currentSession?.csrfToken ?? ""
 
         let script = """
         let ex = [];
@@ -585,17 +606,49 @@ public final class InstagramWebBridge: NSObject, WKNavigationDelegate {
         if (!Array.isArray(ex)) ex = [];
         const existing = new Set(ex);
 
-        // 1. Esegui scroll verso il basso combinato sia sul window che sul documento
-        const scrollTarget = document.documentElement.scrollHeight || document.body.scrollHeight;
-        window.scrollTo({ top: scrollTarget, behavior: 'smooth' });
-        window.dispatchEvent(new Event('scroll'));
-        await new Promise(r => setTimeout(r, 1200));
+        let cur = (typeof cursor !== 'undefined' ? cursor : (arguments[0] && typeof arguments[0] === 'object' ? arguments[0].cursor : '')) || '';
+        let uid = (typeof userId !== 'undefined' ? userId : (arguments[0] && typeof arguments[0] === 'object' ? arguments[0].userId : '')) || '';
+        let csrf = (typeof csrfToken !== 'undefined' ? csrfToken : (arguments[0] && typeof arguments[0] === 'object' ? arguments[0].csrfToken : '')) || '';
+        if (!csrf) {
+            const m = document.cookie.match(/csrftoken=([^;]+)/);
+            if (m && m[1]) csrf = m[1];
+        }
 
-        window.scrollBy({ top: 3000, behavior: 'smooth' });
-        window.dispatchEvent(new Event('scroll'));
-        await new Promise(r => setTimeout(r, 1200));
+        const headers = {
+            'x-ig-app-id': '936619743392459',
+            'x-asbd-id': '129477',
+            'x-csrftoken': csrf,
+            'x-requested-with': 'XMLHttpRequest',
+            'Accept': 'application/json, text/plain, */*'
+        };
 
-        // 2. Raccogli tutti i post presenti nel DOM non ancora salvati
+        // 1. Prova fetch GraphQL query con query_hash per paginazione diretta ufficiale
+        if (cur && uid) {
+            try {
+                const gqlRes = await fetch('https://www.instagram.com/graphql/query/?query_hash=69cba40317214236af40e7efa697781d&variables=' + encodeURIComponent(JSON.stringify({
+                    id: uid,
+                    first: 24,
+                    after: cur
+                })), { headers: headers, credentials: 'include' });
+                if (gqlRes.ok) {
+                    const j = await gqlRes.json();
+                    if (j && j.data) {
+                        return JSON.stringify(j);
+                    }
+                }
+            } catch(e) {}
+        }
+
+        // 2. Esegui scroll verso il basso progressivo per innescare IntersectionObserver di React
+        for (let step = 0; step < 3; step++) {
+            const scrollTarget = document.documentElement.scrollHeight || document.body.scrollHeight;
+            window.scrollTo({ top: scrollTarget, behavior: 'smooth' });
+            window.dispatchEvent(new Event('scroll'));
+            window.dispatchEvent(new CustomEvent('scroll'));
+            await new Promise(r => setTimeout(r, 700));
+        }
+
+        // 3. Raccogli tutti i post presenti nel DOM non ancora salvati
         const links = Array.from(document.querySelectorAll('a[href*="/p/"], a[href*="/reel/"], a[href*="/reels/"]'));
         const newPosts = [];
         for (const a of links) {
@@ -629,7 +682,12 @@ public final class InstagramWebBridge: NSObject, WKNavigationDelegate {
         do {
             let result = try await wv.callAsyncJavaScript(
                 script,
-                arguments: ["existing": existingShortcodes],
+                arguments: [
+                    "existing": existingShortcodes,
+                    "cursor": cursor ?? "",
+                    "userId": userID ?? "",
+                    "csrfToken": effectiveCSRF
+                ],
                 in: nil,
                 contentWorld: .page
             )
@@ -646,7 +704,12 @@ public final class InstagramWebBridge: NSObject, WKNavigationDelegate {
         prepare()
         guard let wv = webView else { return nil }
 
-        await waitForWebViewReady(wv, timeout: 3.5)
+        let cleanUname = username?.trimmingCharacters(in: .whitespacesAndNewlines).replacingOccurrences(of: "@", with: "") ?? ""
+        if !cleanUname.isEmpty {
+            await navigateToTargetProfile(wv, username: cleanUname)
+        } else {
+            await waitForWebViewReady(wv, timeout: 3.5)
+        }
 
         let script = """
         let uid = '';
@@ -724,6 +787,7 @@ public final class InstagramWebBridge: NSObject, WKNavigationDelegate {
             }
         } catch(e) {}
 
+        let discoveredUname = uname;
         // Prova 4: endpoint form data (se ha username, prova subito web_profile_info per ottenere avatar)
         try {
             const res = await fetch('https://www.instagram.com/api/v1/accounts/edit/web_form_data/', {
@@ -734,6 +798,7 @@ public final class InstagramWebBridge: NSObject, WKNavigationDelegate {
                 const j = await res.json();
                 const foundUname = j?.form_data?.username || j?.user?.username;
                 if (foundUname) {
+                    discoveredUname = foundUname;
                     try {
                         const profRes = await fetch('https://www.instagram.com/api/v1/users/web_profile_info/?username=' + encodeURIComponent(foundUname), {
                             headers: headers,
@@ -747,8 +812,8 @@ public final class InstagramWebBridge: NSObject, WKNavigationDelegate {
                         }
                     } catch(pe) {}
                 }
-                if (j && (j.user || j.form_data)) {
-                    return JSON.stringify(j.user || j.form_data);
+                if (j && j.user && (j.user.profile_pic_url || j.user.profile_pic_url_hd)) {
+                    return JSON.stringify(j.user);
                 }
             }
         } catch(e) {}
@@ -756,7 +821,10 @@ public final class InstagramWebBridge: NSObject, WKNavigationDelegate {
         // Prova 5: estrazione da window._sharedData
         try {
             if (window._sharedData && window._sharedData.config && window._sharedData.config.viewer) {
-                return JSON.stringify(window._sharedData.config.viewer);
+                const v = window._sharedData.config.viewer;
+                if (v && (v.profile_pic_url || v.profile_pic_url_hd || v.profile_picture)) {
+                    return JSON.stringify(v);
+                }
             }
         } catch(e) {}
 
@@ -765,20 +833,20 @@ public final class InstagramWebBridge: NSObject, WKNavigationDelegate {
             const scripts = document.querySelectorAll('script[type="application/json"]');
             for (const s of scripts) {
                 const txt = s.textContent || '';
-                if (txt.includes('viewer') || txt.includes('"username"')) {
+                if (txt.includes('profile_pic_url') || txt.includes('"username"')) {
                     const parsed = JSON.parse(txt);
-                    function findUser(obj) {
+                    function findUserWithAvatar(obj) {
                         if (!obj || typeof obj !== 'object') return null;
-                        if (obj.username && (obj.pk || obj.id)) {
-                            if (!uid || obj.pk === uid || obj.id === uid) return obj;
+                        if (obj.username && (obj.profile_pic_url || obj.profile_pic_url_hd)) {
+                            if (!uid || obj.pk === uid || obj.id === uid || (discoveredUname && obj.username.toLowerCase() === discoveredUname.toLowerCase())) return obj;
                         }
                         for (const k in obj) {
-                            const found = findUser(obj[k]);
+                            const found = findUserWithAvatar(obj[k]);
                             if (found) return found;
                         }
                         return null;
                     }
-                    const found = findUser(parsed);
+                    const found = findUserWithAvatar(parsed);
                     if (found) return JSON.stringify(found);
                 }
             }
@@ -786,18 +854,22 @@ public final class InstagramWebBridge: NSObject, WKNavigationDelegate {
 
         // Prova 7: estrazione avatar dal DOM dell'app web Instagram
         try {
-            const avatarImg = document.querySelector('header img, nav img, img[alt*="profilo"], img[alt*="profile"], img[data-testid*="user-avatar"]');
+            const avatarImg = document.querySelector('header img, nav img, img[alt*="profilo"], img[alt*="profile"], img[data-testid*="user-avatar"], img[crossorigin="anonymous"]');
             if (avatarImg && (avatarImg.currentSrc || avatarImg.src)) {
                 const src = avatarImg.currentSrc || avatarImg.src;
-                if (src && !src.startsWith('data:')) {
+                if (src && !src.startsWith('data:') && !src.includes('static')) {
                     return JSON.stringify({
-                        username: uname || '',
+                        username: discoveredUname || uname || '',
                         profile_pic_url_hd: src,
                         profile_pic_url: src
                     });
                 }
             }
         } catch(e) {}
+
+        if (discoveredUname && discoveredUname.length > 0) {
+            return JSON.stringify({ username: discoveredUname });
+        }
 
         return null;
         """

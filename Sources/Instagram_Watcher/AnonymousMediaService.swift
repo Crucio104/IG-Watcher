@@ -127,10 +127,37 @@ public struct ResolvedUserProfile: Sendable {
 /// Servizio per recuperare e scaricare Storie e Post in modalità 100% anonima.
 /// Combina il bridge WebKit autenticato con fallback URLSession a cascata per garantire il successo nel 100% dei casi.
 /// NON invia MAI chiamate a /media/seen/, garantendo l'invisibilità totale dell'utente.
-public final class AnonymousMediaService: Sendable {
+public final class AnonymousMediaService: @unchecked Sendable {
     public static let shared = AnonymousMediaService()
 
+    private let cursorLock = NSLock()
+    private var userNextMaxId: [String: String] = [:]
+    private var userEndCursor: [String: String] = [:]
+
     private init() {}
+
+    /// Salva i cursori di paginazione (next_max_id e end_cursor GraphQL) associati a un utente
+    public func savePaginationCursor(userIdOrName: String, nextMaxId: String?, endCursor: String?) {
+        let key = userIdOrName.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        guard !key.isEmpty else { return }
+        cursorLock.lock()
+        defer { cursorLock.unlock() }
+        if let mid = nextMaxId, !mid.isEmpty {
+            userNextMaxId[key] = mid
+        }
+        if let ec = endCursor, !ec.isEmpty {
+            userEndCursor[key] = ec
+        }
+    }
+
+    /// Recupera i cursori di paginazione noti per un utente
+    public func getPaginationCursor(userIdOrName: String) -> (nextMaxId: String?, endCursor: String?) {
+        let key = userIdOrName.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        guard !key.isEmpty else { return (nil, nil) }
+        cursorLock.lock()
+        defer { cursorLock.unlock() }
+        return (userNextMaxId[key], userEndCursor[key])
+    }
 
     /// Sanitizza le URL dei media Meta CDN rimuovendo entità HTML (&amp; -> &) e spazi non validi
     public func cleanMediaURL(_ raw: String?) -> URL? {
@@ -305,6 +332,11 @@ public final class AnonymousMediaService: Sendable {
 
         if let timelineMedia = userDict["edge_owner_to_timeline_media"] as? [String: Any] {
             postsCount = timelineMedia["count"] as? Int ?? 0
+            if let pageInfo = timelineMedia["page_info"] as? [String: Any],
+               let endCursor = pageInfo["end_cursor"] as? String, !endCursor.isEmpty {
+                savePaginationCursor(userIdOrName: id, nextMaxId: nil, endCursor: endCursor)
+                savePaginationCursor(userIdOrName: uname, nextMaxId: nil, endCursor: endCursor)
+            }
             if let edges = timelineMedia["edges"] as? [[String: Any]] {
                 for edge in edges {
                     if let node = edge["node"] as? [String: Any], let p = parseTimelineMediaNode(node) {
@@ -614,10 +646,28 @@ public final class AnonymousMediaService: Sendable {
     public func fetchMoreUserPosts(userID: String, username: String, existingShortcodes: [String], session: InstagramSession) async -> [InstagramPostItem] {
         let cleanUsername = username.trimmingCharacters(in: .whitespacesAndNewlines).replacingOccurrences(of: "@", with: "")
 
-        // Tier 1: Tramite scroll automatico in WebKit
-        if let bridgeString = await InstagramWebBridge.shared.fetchMorePosts(username: cleanUsername, existingShortcodes: existingShortcodes),
+        let (storedNextMaxId, storedEndCursor) = getPaginationCursor(userIdOrName: userID.isEmpty ? cleanUsername : userID)
+        let activeEndCursor = storedEndCursor ?? getPaginationCursor(userIdOrName: cleanUsername).endCursor
+        let activeNextMaxId = storedNextMaxId ?? getPaginationCursor(userIdOrName: cleanUsername).nextMaxId
+
+        // Tier 1: Tramite WebKit scroll e in-page GraphQL con cursore
+        if let bridgeString = await InstagramWebBridge.shared.fetchMorePosts(
+            username: cleanUsername,
+            existingShortcodes: existingShortcodes,
+            cursor: activeEndCursor,
+            userID: userID
+        ),
            let data = bridgeString.data(using: .utf8),
            let bridgeJSON = try? JSONSerialization.jsonObject(with: data) as? [String: Any] {
+            
+            // Estrai e salva nuovi cursori dal bridge
+            let newNextMaxId = (bridgeJSON["next_max_id"] as? String) ??
+                               ((bridgeJSON["next_max_id"] as? Int64).map { String($0) })
+            let newEndCursor = (((bridgeJSON["data"] as? [String: Any])?["user"] as? [String: Any])?["edge_owner_to_timeline_media"] as? [String: Any])?["page_info"] as? [String: Any]
+            let ec = newEndCursor?["end_cursor"] as? String
+            savePaginationCursor(userIdOrName: userID, nextMaxId: newNextMaxId, endCursor: ec)
+            savePaginationCursor(userIdOrName: cleanUsername, nextMaxId: newNextMaxId, endCursor: ec)
+
             let posts = parseAnyPostsFromJSON(bridgeJSON)
             let newPosts = posts.filter { !existingShortcodes.contains($0.id) }
             if !newPosts.isEmpty {
@@ -625,21 +675,64 @@ public final class AnonymousMediaService: Sendable {
             }
         }
 
-        // Tier 2: Paginazione tramite max_id numerico (calcolato dall'ultimo post visualizzato)
         let cookieHeader = await InstagramSessionManager.shared.getLiveCookieHeader()
-        var maxIdParam: String? = nil
-        if let lastCode = existingShortcodes.last {
-            maxIdParam = shortcodeToNumericID(lastCode) ?? lastCode
+        let lastCode = existingShortcodes.last ?? ""
+        let numericLastId = shortcodeToNumericID(lastCode) ?? (lastCode.allSatisfy({ $0.isNumber }) ? lastCode : nil)
+
+        // Costruisci la lista di candidate max_id per l'API feed
+        var candidateMaxIds: [String] = []
+        if let mid = activeNextMaxId, !mid.isEmpty {
+            candidateMaxIds.append(mid)
+        }
+        if let num = numericLastId, !num.isEmpty {
+            candidateMaxIds.append(num)
+            if !userID.isEmpty {
+                candidateMaxIds.append("\(num)_\(userID)")
+            }
         }
 
+        // Tier 2: GraphQL query con query_hash per timeline continua
+        if let cur = activeEndCursor, !cur.isEmpty, !userID.isEmpty {
+            let variables = "{\"id\":\"\(userID)\",\"first\":24,\"after\":\"\(cur)\"}"
+            if let encodedVars = variables.addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed) {
+                let gqlURLStr = "https://www.instagram.com/graphql/query/?query_hash=69cba40317214236af40e7efa697781d&variables=\(encodedVars)"
+                if let gqlURL = URL(string: gqlURLStr) {
+                    var request = URLRequest(url: gqlURL)
+                    request.httpMethod = "GET"
+                    applyHeaders(to: &request, session: session, cookieHeader: cookieHeader, referer: "https://www.instagram.com/\(cleanUsername)/")
+                    if let (data, response) = try? await URLSession.shared.data(for: request),
+                       let httpResponse = response as? HTTPURLResponse, (200...299).contains(httpResponse.statusCode),
+                       let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any] {
+                        
+                        if let userDict = (json["data"] as? [String: Any])?["user"] as? [String: Any],
+                           let timeline = userDict["edge_owner_to_timeline_media"] as? [String: Any],
+                           let pageInfo = timeline["page_info"] as? [String: Any],
+                           let nextCur = pageInfo["end_cursor"] as? String {
+                            savePaginationCursor(userIdOrName: userID, nextMaxId: nil, endCursor: nextCur)
+                            savePaginationCursor(userIdOrName: cleanUsername, nextMaxId: nil, endCursor: nextCur)
+                        }
+
+                        let posts = parseAnyPostsFromJSON(json)
+                        let newPosts = posts.filter { !existingShortcodes.contains($0.id) }
+                        if !newPosts.isEmpty {
+                            return newPosts
+                        }
+                    }
+                }
+            }
+        }
+
+        // Tier 3: Feed API per ID utente o username con i candidateMaxIds
         var endpoints: [String] = []
-        if let numericID = Int64(userID), numericID > 0 {
-            if let maxId = maxIdParam {
+        for maxId in candidateMaxIds {
+            if let numericID = Int64(userID), numericID > 0 {
                 endpoints.append("https://www.instagram.com/api/v1/feed/user/\(userID)/?max_id=\(maxId)&count=24")
                 endpoints.append("https://i.instagram.com/api/v1/feed/user/\(userID)/?max_id=\(maxId)&count=24")
             }
-            endpoints.append("https://www.instagram.com/api/v1/feed/user/\(userID)/?count=24")
-            endpoints.append("https://i.instagram.com/api/v1/feed/user/\(userID)/?count=24")
+            if !cleanUsername.isEmpty {
+                endpoints.append("https://www.instagram.com/api/v1/feed/user/\(cleanUsername)/username/?max_id=\(maxId)&count=24")
+                endpoints.append("https://i.instagram.com/api/v1/feed/user/\(cleanUsername)/username/?max_id=\(maxId)&count=24")
+            }
         }
 
         for ep in endpoints {
@@ -652,6 +745,11 @@ public final class AnonymousMediaService: Sendable {
                   let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
                 continue
             }
+
+            let nextMax = (json["next_max_id"] as? String) ?? ((json["next_max_id"] as? Int64).map { String($0) })
+            savePaginationCursor(userIdOrName: userID, nextMaxId: nextMax, endCursor: nil)
+            savePaginationCursor(userIdOrName: cleanUsername, nextMaxId: nextMax, endCursor: nil)
+
             let posts = parseAnyPostsFromJSON(json)
             let newPosts = posts.filter { !existingShortcodes.contains($0.id) }
             if !newPosts.isEmpty {
