@@ -43,7 +43,7 @@ public struct AnonymousMediaViewerSheet: View {
     }
 
     public var body: some View {
-        NavigationView {
+        NavigationStack {
             ZStack {
                 Color(UIColor.systemBackground)
                     .ignoresSafeArea()
@@ -148,6 +148,8 @@ public struct AnonymousMediaViewerSheet: View {
                         Task { await downloadMedia(url: url, isVideo: isVideo) }
                     }
                 )
+                .presentationDetents([.large])
+                .presentationDragIndicator(.visible)
             }
             .sheet(item: Binding(
                 get: { profileURLToShare.map { ShareItem(url: $0) } },
@@ -777,11 +779,7 @@ public struct AnonymousMediaViewerSheet: View {
 
         let totalExpected = profile?.postsCount ?? user.mediaCount ?? 0
         if newItems.isEmpty {
-            if totalExpected > 0 && posts.count >= totalExpected {
-                canLoadMorePosts = false
-            } else if totalExpected == 0 && !posts.isEmpty {
-                canLoadMorePosts = false
-            }
+            canLoadMorePosts = false
         } else {
             var existingSet = Set(self.posts.map { $0.id })
             var toAdd: [InstagramPostItem] = []
@@ -792,14 +790,12 @@ public struct AnonymousMediaViewerSheet: View {
                 }
             }
             if toAdd.isEmpty {
-                if totalExpected > 0 && posts.count >= totalExpected {
-                    canLoadMorePosts = false
-                }
+                canLoadMorePosts = false
             } else {
                 withAnimation {
                     self.posts.append(contentsOf: toAdd)
                 }
-                if totalExpected > 0 && self.posts.count >= totalExpected {
+                if totalExpected > 24 && self.posts.count >= totalExpected {
                     canLoadMorePosts = false
                 }
             }
@@ -1265,7 +1261,7 @@ public struct InstagramPostDetailSheet: View {
     }
 
     public var body: some View {
-        NavigationView {
+        NavigationStack {
             ZStack(alignment: .bottom) {
                 ScrollView {
                     VStack(alignment: .leading, spacing: 12) {
@@ -1565,12 +1561,10 @@ public struct InstagramPostDetailSheet: View {
                 if let sess = session ?? InstagramSessionManager.shared.currentSession {
                     isFetchingDetails = true
                     if let detailed = await AnonymousMediaService.shared.fetchPostDetails(shortcode: currentPost.id, session: sess) {
-                        withAnimation(.easeInOut) {
-                            if currentPost.isCarousel && detailed.carouselItems.isEmpty {
-                                // Preserva la struttura carosello se il dettaglio ha restituito solo la prima miniatura
-                            } else {
-                                self.currentPost = detailed
-                            }
+                        if currentPost.isCarousel && detailed.carouselItems.isEmpty {
+                            // Preserva la struttura carosello se il dettaglio ha restituito solo la prima miniatura
+                        } else {
+                            self.currentPost = detailed
                         }
                     }
                     isFetchingDetails = false

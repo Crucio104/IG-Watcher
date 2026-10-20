@@ -300,6 +300,20 @@ public final class AnonymousMediaService: @unchecked Sendable {
         }
 
         if !posts.isEmpty || json["dom_posts"] != nil {
+            // Salva cursore di paginazione iniziale per consentire il caricamento di tutti i post successivi
+            let nextMax = (json["next_max_id"] as? String) ??
+                          ((json["next_max_id"] as? NSNumber)?.stringValue) ??
+                          ((json["data"] as? [String: Any])?["next_max_id"] as? String) ??
+                          (posts.last.flatMap { shortcodeToNumericID($0.id) ?? $0.id })
+            if let mid = nextMax, !mid.isEmpty {
+                savePaginationCursor(userIdOrName: defaultUser.id, nextMaxId: mid, endCursor: nil)
+                savePaginationCursor(userIdOrName: cleanUsername, nextMaxId: mid, endCursor: nil)
+            }
+
+            let explicitTotal = (json["media_count"] as? Int) ??
+                                ((json["user"] as? [String: Any])?["media_count"] as? Int) ??
+                                defaultUser.mediaCount ?? 0
+
             return ResolvedUserProfile(
                 id: defaultUser.id,
                 username: cleanUsername,
@@ -311,7 +325,7 @@ public final class AnonymousMediaService: @unchecked Sendable {
                 followedByViewer: followedLocally,
                 followersCount: 0,
                 followingCount: 0,
-                postsCount: max(defaultUser.mediaCount ?? 0, posts.count),
+                postsCount: explicitTotal > 0 ? explicitTotal : posts.count,
                 initialPosts: posts
             )
         }
@@ -372,7 +386,20 @@ public final class AnonymousMediaService: @unchecked Sendable {
 
         if parsedPosts.isEmpty, let items = userDict["items"] as? [[String: Any]] {
             parsedPosts = parseItemsArray(items)
-            postsCount = parsedPosts.count
+        }
+
+        let explicitTotal = (userDict["media_count"] as? Int) ?? (userDict["posts_count"] as? Int) ?? 0
+        if explicitTotal > 0 {
+            postsCount = explicitTotal
+        }
+
+        // Salva cursore iniziale se disponibile
+        let userNextMax = (userDict["next_max_id"] as? String) ??
+                          ((userDict["next_max_id"] as? NSNumber)?.stringValue) ??
+                          (parsedPosts.last.flatMap { shortcodeToNumericID($0.id) ?? $0.id })
+        if let mid = userNextMax, !mid.isEmpty {
+            savePaginationCursor(userIdOrName: id, nextMaxId: mid, endCursor: nil)
+            savePaginationCursor(userIdOrName: uname, nextMaxId: mid, endCursor: nil)
         }
 
         return ResolvedUserProfile(
@@ -641,14 +668,31 @@ public final class AnonymousMediaService: @unchecked Sendable {
     /// Helper: converte uno shortcode di Instagram (es. DA_xyz) nel suo ID numerico a 64-bit per le API ufficiali
     public func shortcodeToNumericID(_ shortcode: String) -> String? {
         let clean = shortcode.trimmingCharacters(in: .whitespacesAndNewlines)
-        if clean.allSatisfy({ $0.isNumber }) && !clean.isEmpty {
+        if clean.isEmpty { return nil }
+
+        // Se è già solo numerico
+        if clean.allSatisfy({ $0.isNumber }) {
             return clean
         }
+
+        // Se è nel formato standard Instagram "{media_id}_{user_id}"
+        if clean.contains("_") {
+            let parts = clean.components(separatedBy: "_")
+            if let first = parts.first, !first.isEmpty, first.allSatisfy({ $0.isNumber }) {
+                return first
+            }
+        }
+
+        // Altrimenti decodifica Base64 shortcode (es. "C123abc")
         let alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_"
         var id: UInt64 = 0
         for char in clean {
             guard let index = alphabet.firstIndex(of: char) else { return nil }
             let val = UInt64(alphabet.distance(from: alphabet.startIndex, to: index))
+            // Evita overflow se la stringa non è un vero shortcode
+            if id > (UInt64.max - val) / 64 {
+                return nil
+            }
             id = id * 64 + val
         }
         return id > 0 ? String(id) : nil
@@ -663,18 +707,25 @@ public final class AnonymousMediaService: @unchecked Sendable {
         let activeNextMaxId = storedNextMaxId ?? getPaginationCursor(userIdOrName: cleanUsername).nextMaxId
 
         let lastCode = existingShortcodes.last ?? ""
-        let numericLastId = shortcodeToNumericID(lastCode) ?? (lastCode.allSatisfy({ $0.isNumber }) ? lastCode : nil)
+        let numericLastId = shortcodeToNumericID(lastCode)
 
-        // Costruisci la lista di candidate max_id per l'API feed
+        // Costruisci la lista ordinata di candidate max_id per l'API feed
         var candidateMaxIds: [String] = []
         if let mid = activeNextMaxId, !mid.isEmpty {
             candidateMaxIds.append(mid)
+            if mid.contains("_"), let prefix = mid.components(separatedBy: "_").first, !prefix.isEmpty {
+                if !candidateMaxIds.contains(prefix) { candidateMaxIds.append(prefix) }
+            }
         }
         if let num = numericLastId, !num.isEmpty {
-            candidateMaxIds.append(num)
+            if !candidateMaxIds.contains(num) { candidateMaxIds.append(num) }
             if !userID.isEmpty {
-                candidateMaxIds.append("\(num)_\(userID)")
+                let comp = "\(num)_\(userID)"
+                if !candidateMaxIds.contains(comp) { candidateMaxIds.append(comp) }
             }
+        }
+        if !lastCode.isEmpty && !candidateMaxIds.contains(lastCode) {
+            candidateMaxIds.append(lastCode)
         }
 
         // Tier 1: Tramite WebKit Feed API in-page, GraphQL e scroll
@@ -683,6 +734,7 @@ public final class AnonymousMediaService: @unchecked Sendable {
             existingShortcodes: existingShortcodes,
             cursor: activeEndCursor,
             maxId: candidateMaxIds.first,
+            candidateMaxIds: candidateMaxIds,
             userID: userID
         ),
            let data = bridgeString.data(using: .utf8),
@@ -690,14 +742,23 @@ public final class AnonymousMediaService: @unchecked Sendable {
             
             // Estrai e salva nuovi cursori dal bridge
             let newNextMaxId = (bridgeJSON["next_max_id"] as? String) ??
-                               ((bridgeJSON["next_max_id"] as? Int64).map { String($0) })
+                               ((bridgeJSON["next_max_id"] as? NSNumber)?.stringValue) ??
+                               ((bridgeJSON["data"] as? [String: Any])?["next_max_id"] as? String)
             let newEndCursor = (((bridgeJSON["data"] as? [String: Any])?["user"] as? [String: Any])?["edge_owner_to_timeline_media"] as? [String: Any])?["page_info"] as? [String: Any]
             let ec = newEndCursor?["end_cursor"] as? String
-            savePaginationCursor(userIdOrName: userID, nextMaxId: newNextMaxId, endCursor: ec)
-            savePaginationCursor(userIdOrName: cleanUsername, nextMaxId: newNextMaxId, endCursor: ec)
 
             let posts = parseAnyPostsFromJSON(bridgeJSON)
             let newPosts = posts.filter { !existingShortcodes.contains($0.id) }
+
+            let effectiveMax = newNextMaxId ?? (newPosts.last.flatMap { shortcodeToNumericID($0.id) ?? $0.id })
+            if let em = effectiveMax, !em.isEmpty {
+                savePaginationCursor(userIdOrName: userID, nextMaxId: em, endCursor: ec)
+                savePaginationCursor(userIdOrName: cleanUsername, nextMaxId: em, endCursor: ec)
+            } else if let ec = ec, !ec.isEmpty {
+                savePaginationCursor(userIdOrName: userID, nextMaxId: nil, endCursor: ec)
+                savePaginationCursor(userIdOrName: cleanUsername, nextMaxId: nil, endCursor: ec)
+            }
+
             if !newPosts.isEmpty {
                 return newPosts
             }
@@ -760,12 +821,18 @@ public final class AnonymousMediaService: @unchecked Sendable {
                 continue
             }
 
-            let nextMax = (json["next_max_id"] as? String) ?? ((json["next_max_id"] as? Int64).map { String($0) })
-            savePaginationCursor(userIdOrName: userID, nextMaxId: nextMax, endCursor: nil)
-            savePaginationCursor(userIdOrName: cleanUsername, nextMaxId: nextMax, endCursor: nil)
-
+            let nextMax = (json["next_max_id"] as? String) ??
+                          ((json["next_max_id"] as? NSNumber)?.stringValue) ??
+                          ((json["data"] as? [String: Any])?["next_max_id"] as? String)
             let posts = parseAnyPostsFromJSON(json)
             let newPosts = posts.filter { !existingShortcodes.contains($0.id) }
+
+            let effectiveMax = nextMax ?? (newPosts.last.flatMap { shortcodeToNumericID($0.id) ?? $0.id })
+            if let em = effectiveMax, !em.isEmpty {
+                savePaginationCursor(userIdOrName: userID, nextMaxId: em, endCursor: nil)
+                savePaginationCursor(userIdOrName: cleanUsername, nextMaxId: em, endCursor: nil)
+            }
+
             if !newPosts.isEmpty {
                 return newPosts
             }

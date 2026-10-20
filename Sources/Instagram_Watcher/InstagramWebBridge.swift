@@ -455,6 +455,12 @@ public final class InstagramWebBridge: NSObject, WKNavigationDelegate {
 
         // Helper: conversione shortcode in ID numerico media Instagram per interrogare /api/v1/media/{id}/info/
         function shortcodeToNumericID(sc) {
+            if (!sc) return null;
+            if (/^[0-9]+$/.test(sc)) return sc;
+            if (sc.includes('_')) {
+                const prefix = sc.split('_')[0];
+                if (/^[0-9]+$/.test(prefix)) return prefix;
+            }
             const alphabet = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_';
             let id = BigInt(0);
             for (let i = 0; i < sc.length; i++) {
@@ -466,7 +472,7 @@ public final class InstagramWebBridge: NSObject, WKNavigationDelegate {
         }
 
         // 1. Prova API endpoint ufficiale /api/v1/media/{media_id}/info/ (restituisce carousel_media completo al 100%)
-        const numericId = /^[0-9]+$/.test(code) ? code : shortcodeToNumericID(code);
+        const numericId = shortcodeToNumericID(code);
         if (numericId) {
             try {
                 const mediaRes = await fetch('https://www.instagram.com/api/v1/media/' + numericId + '/info/', {
@@ -584,6 +590,7 @@ public final class InstagramWebBridge: NSObject, WKNavigationDelegate {
         existingShortcodes: [String],
         cursor: String? = nil,
         maxId: String? = nil,
+        candidateMaxIds: [String] = [],
         userID: String? = nil
     ) async -> String? {
         prepare()
@@ -628,14 +635,26 @@ public final class InstagramWebBridge: NSObject, WKNavigationDelegate {
         };
 
         // 1. Prova fetch in-page Feed API con max_id (usato dall'API ufficiale per recuperare i post precedenti)
-        if (mid) {
-            const candidateIds = [mid];
-            if (mid.includes('_')) {
-                candidateIds.push(mid.split('_')[0]);
-            } else if (uid) {
-                candidateIds.push(mid + '_' + uid);
-            }
+        let rawCands = [];
+        if (typeof candidateIds !== 'undefined' && Array.isArray(candidateIds)) rawCands = candidateIds;
+        else if (arguments[0] && Array.isArray(arguments[0].candidateIds)) rawCands = arguments[0].candidateIds;
+        if (mid && !rawCands.includes(mid)) rawCands.unshift(mid);
 
+        const candidateIds = [];
+        for (const c of rawCands) {
+            const sc = String(c || '').trim();
+            if (!sc) continue;
+            if (!candidateIds.includes(sc)) candidateIds.push(sc);
+            if (sc.includes('_')) {
+                const prefix = sc.split('_')[0];
+                if (prefix && !candidateIds.includes(prefix)) candidateIds.push(prefix);
+            } else if (uid) {
+                const comp = sc + '_' + uid;
+                if (!candidateIds.includes(comp)) candidateIds.push(comp);
+            }
+        }
+
+        if (candidateIds.length > 0) {
             for (const cand of candidateIds) {
                 if (uid && /^[0-9]+$/.test(uid)) {
                     try {
@@ -742,6 +761,7 @@ public final class InstagramWebBridge: NSObject, WKNavigationDelegate {
                     "existing": existingShortcodes,
                     "cursor": cursor ?? "",
                     "maxId": maxId ?? "",
+                    "candidateIds": candidateMaxIds,
                     "userId": userID ?? "",
                     "username": clean,
                     "csrfToken": effectiveCSRF
