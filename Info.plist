@@ -1,0 +1,37 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>CFBundleIdentifier</key>
+    <string>com.example.Instagram-Watcher</string>
+    <key>CFBundleName</key>
+    <string>IG Watcher</string>
+    <key>CFBundleDisplayName</key>
+    <string>IG Watcher</string>
+    <key>CFBundleShortVersionString</key>
+    <string>1.0.0</string>
+    <key>CFBundleVersion</key>
+    <string>1</string>
+    <key>LSRequiresIPhoneOS</key>
+    <true/>
+    <!-- Necessario su iOS per permettere a canOpenURL di verificare e aprire instagram:// -->
+    <key>LSApplicationQueriesSchemes</key>
+    <array>
+        <string>instagram</string>
+    </array>
+    <key>NSAppTransportSecurity</key>
+    <dict>
+        <key>NSAllowsArbitraryLoads</key>
+        <false/>
+    </dict>
+    <key>NSPhotoLibraryAddUsageDescription</key>
+    <string>IG Watcher requires photo library access to save downloaded stories and posts.</string>
+    <key>NSPhotoLibraryUsageDescription</key>
+    <string>IG Watcher requires photo library access to save downloaded stories and posts.</string>
+    <key>UIBackgroundModes</key>
+    <array>
+        <string>fetch</string>
+        <string>processing</string>
+    </array>
+</dict>
+</plist>
