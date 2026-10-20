@@ -583,6 +583,7 @@ public final class InstagramWebBridge: NSObject, WKNavigationDelegate {
         username: String,
         existingShortcodes: [String],
         cursor: String? = nil,
+        maxId: String? = nil,
         userID: String? = nil
     ) async -> String? {
         prepare()
@@ -607,7 +608,11 @@ public final class InstagramWebBridge: NSObject, WKNavigationDelegate {
         const existing = new Set(ex);
 
         let cur = (typeof cursor !== 'undefined' ? cursor : (arguments[0] && typeof arguments[0] === 'object' ? arguments[0].cursor : '')) || '';
+        let mid = (typeof maxId !== 'undefined' ? maxId : (arguments[0] && typeof arguments[0] === 'object' ? arguments[0].maxId : '')) || '';
         let uid = (typeof userId !== 'undefined' ? userId : (arguments[0] && typeof arguments[0] === 'object' ? arguments[0].userId : '')) || '';
+        let uname = (typeof username !== 'undefined' ? username : (arguments[0] && typeof arguments[0] === 'object' ? arguments[0].username : '')) || '';
+        uname = String(uname || '').toLowerCase().replace(/@/g, '').trim();
+
         let csrf = (typeof csrfToken !== 'undefined' ? csrfToken : (arguments[0] && typeof arguments[0] === 'object' ? arguments[0].csrfToken : '')) || '';
         if (!csrf) {
             const m = document.cookie.match(/csrftoken=([^;]+)/);
@@ -622,7 +627,49 @@ public final class InstagramWebBridge: NSObject, WKNavigationDelegate {
             'Accept': 'application/json, text/plain, */*'
         };
 
-        // 1. Prova fetch GraphQL query con query_hash per paginazione diretta ufficiale
+        // 1. Prova fetch in-page Feed API con max_id (usato dall'API ufficiale per recuperare i post precedenti)
+        if (mid) {
+            const candidateIds = [mid];
+            if (mid.includes('_')) {
+                candidateIds.push(mid.split('_')[0]);
+            } else if (uid) {
+                candidateIds.push(mid + '_' + uid);
+            }
+
+            for (const cand of candidateIds) {
+                if (uid && /^[0-9]+$/.test(uid)) {
+                    try {
+                        const feedRes = await fetch('https://www.instagram.com/api/v1/feed/user/' + encodeURIComponent(uid) + '/?count=24&max_id=' + encodeURIComponent(cand), {
+                            headers: headers,
+                            credentials: 'include'
+                        });
+                        if (feedRes.ok) {
+                            const j = await feedRes.json();
+                            if (j && (j.items || j.data)) {
+                                return JSON.stringify(j);
+                            }
+                        }
+                    } catch(e) {}
+                }
+
+                if (uname) {
+                    try {
+                        const feedRes = await fetch('https://www.instagram.com/api/v1/feed/user/' + encodeURIComponent(uname) + '/username/?count=24&max_id=' + encodeURIComponent(cand), {
+                            headers: headers,
+                            credentials: 'include'
+                        });
+                        if (feedRes.ok) {
+                            const j = await feedRes.json();
+                            if (j && (j.items || j.data)) {
+                                return JSON.stringify(j);
+                            }
+                        }
+                    } catch(e) {}
+                }
+            }
+        }
+
+        // 2. Prova fetch GraphQL query con query_hash per paginazione diretta con end_cursor
         if (cur && uid) {
             try {
                 const gqlRes = await fetch('https://www.instagram.com/graphql/query/?query_hash=69cba40317214236af40e7efa697781d&variables=' + encodeURIComponent(JSON.stringify({
@@ -639,16 +686,21 @@ public final class InstagramWebBridge: NSObject, WKNavigationDelegate {
             } catch(e) {}
         }
 
-        // 2. Esegui scroll verso il basso progressivo per innescare IntersectionObserver di React
+        // 3. Esegui scroll progressivo su tutti i contenitori di scorrimento (window, document, main)
+        const scrollers = [window, document.documentElement, document.body, document.querySelector('main'), document.scrollingElement].filter(Boolean);
         for (let step = 0; step < 3; step++) {
-            const scrollTarget = document.documentElement.scrollHeight || document.body.scrollHeight;
-            window.scrollTo({ top: scrollTarget, behavior: 'smooth' });
+            for (const s of scrollers) {
+                if (typeof s.scrollTo === 'function') {
+                    const max = s.scrollHeight || document.body.scrollHeight || 10000;
+                    s.scrollTo(0, max);
+                }
+            }
             window.dispatchEvent(new Event('scroll'));
             window.dispatchEvent(new CustomEvent('scroll'));
-            await new Promise(r => setTimeout(r, 700));
+            await new Promise(r => setTimeout(r, 600));
         }
 
-        // 3. Raccogli tutti i post presenti nel DOM non ancora salvati
+        // 4. Raccogli tutti i post presenti nel DOM non ancora salvati
         const links = Array.from(document.querySelectorAll('a[href*="/p/"], a[href*="/reel/"], a[href*="/reels/"]'));
         const newPosts = [];
         for (const a of links) {
@@ -676,7 +728,11 @@ public final class InstagramWebBridge: NSObject, WKNavigationDelegate {
             });
         }
 
-        return JSON.stringify({ dom_posts: newPosts });
+        if (newPosts.length > 0) {
+            return JSON.stringify({ dom_posts: newPosts });
+        }
+
+        return null;
         """
 
         do {
@@ -685,7 +741,9 @@ public final class InstagramWebBridge: NSObject, WKNavigationDelegate {
                 arguments: [
                     "existing": existingShortcodes,
                     "cursor": cursor ?? "",
+                    "maxId": maxId ?? "",
                     "userId": userID ?? "",
+                    "username": clean,
                     "csrfToken": effectiveCSRF
                 ],
                 in: nil,
@@ -766,29 +824,33 @@ public final class InstagramWebBridge: NSObject, WKNavigationDelegate {
                 });
                 if (res.ok) {
                     const j = await res.json();
-                    if (j && j.user) {
+                    if (j && j.user && (j.user.profile_pic_url || j.user.profile_pic_url_hd)) {
                         return JSON.stringify(j.user);
                     }
                 }
             } catch(e) {}
         }
 
-        // Prova 3: endpoint ufficiale web account autenticato
-        try {
-            const res = await fetch('https://www.instagram.com/api/v1/accounts/current_user/?edit=true', {
-                headers: headers,
-                credentials: 'include'
-            });
-            if (res.ok) {
-                const j = await res.json();
-                if (j && j.user) {
-                    return JSON.stringify(j.user);
+        // Prova 3: Feed dell'utente (restituisce i post e in ogni post contiene user.profile_pic_url reale)
+        if (uid && uid.length > 0) {
+            try {
+                const feedRes = await fetch('https://www.instagram.com/api/v1/feed/user/' + encodeURIComponent(uid) + '/?count=1', {
+                    headers: headers,
+                    credentials: 'include'
+                });
+                if (feedRes.ok) {
+                    const fj = await feedRes.json();
+                    const firstItem = fj?.items?.[0] || fj?.data?.items?.[0];
+                    if (firstItem?.user?.profile_pic_url) {
+                        return JSON.stringify(firstItem.user);
+                    }
                 }
-            }
-        } catch(e) {}
+            } catch(e) {}
+        }
 
         let discoveredUname = uname;
-        // Prova 4: endpoint form data (se ha username, prova subito web_profile_info per ottenere avatar)
+
+        // Prova 4: endpoint form data (se ha username, cerca subito l'avatar)
         try {
             const res = await fetch('https://www.instagram.com/api/v1/accounts/edit/web_form_data/', {
                 headers: headers,
@@ -852,9 +914,14 @@ public final class InstagramWebBridge: NSObject, WKNavigationDelegate {
             }
         } catch(e) {}
 
-        // Prova 7: estrazione avatar dal DOM dell'app web Instagram
+        // Prova 7: Ricerca di qualsiasi immagine con hash avatar Instagram (t51.2885-19) nel DOM
         try {
-            const avatarImg = document.querySelector('header img, nav img, img[alt*="profilo"], img[alt*="profile"], img[data-testid*="user-avatar"], img[crossorigin="anonymous"]');
+            const allImgs = Array.from(document.querySelectorAll('img'));
+            const avatarImg = allImgs.find(img => {
+                const src = img.currentSrc || img.src || '';
+                return src.includes('t51.2885-19') && !src.startsWith('data:');
+            }) || document.querySelector('header img, nav img, img[alt*="profilo"], img[alt*="profile"], img[data-testid*="user-avatar"]');
+
             if (avatarImg && (avatarImg.currentSrc || avatarImg.src)) {
                 const src = avatarImg.currentSrc || avatarImg.src;
                 if (src && !src.startsWith('data:') && !src.includes('static')) {
@@ -862,6 +929,22 @@ public final class InstagramWebBridge: NSObject, WKNavigationDelegate {
                         username: discoveredUname || uname || '',
                         profile_pic_url_hd: src,
                         profile_pic_url: src
+                    });
+                }
+            }
+        } catch(e) {}
+
+        // Prova 8: Ricerca diretta nell'HTML completo per profile_pic_url
+        try {
+            const html = document.documentElement.innerHTML;
+            const match = html.match(/"profile_pic_url(?:_hd)?":\\s*"([^"]+)"/);
+            if (match && match[1]) {
+                const cleanURL = match[1].split('\\\\u0026').join('&').split('\\\\/').join('/').split('&amp;').join('&');
+                if (cleanURL.indexOf('http') === 0) {
+                    return JSON.stringify({
+                        username: discoveredUname || uname || '',
+                        profile_pic_url_hd: cleanURL,
+                        profile_pic_url: cleanURL
                     });
                 }
             }

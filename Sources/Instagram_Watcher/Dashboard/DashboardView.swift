@@ -309,8 +309,37 @@ public struct DashboardView: View {
         guard let session = sessionManager.currentSession else { return }
         let knownUsername = sessionManager.currentUserProfile?.username ?? UserDefaults.standard.string(forKey: "com.instagramwatcher.cached_username")
         Task {
-            // Tentativo 0: Se l'username è noto ma manca l'avatar, risolviamo direttamente tramite la pagina profilo
-            if let uname = knownUsername, !uname.isEmpty {
+            // Tentativo 1: WebKit autenticato con credenziali live (estrae username e avatar con Regex/DOM e Feed)
+            if let jsonString = await InstagramWebBridge.shared.fetchCurrentUserProfile(userID: session.userID, username: knownUsername),
+               let data = jsonString.data(using: .utf8),
+               let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any] {
+                let uname = (json["username"] as? String) ?? (knownUsername ?? "")
+                let fullName = (json["full_name"] as? String) ?? (json["first_name"] as? String) ?? ""
+                let isVerified = (json["is_verified"] as? Bool) ?? false
+                let rawPic = (json["profile_pic_url_hd"] as? String) ??
+                             (json["profile_pic_url"] as? String) ??
+                             ((json["hd_profile_pic_url_info"] as? [String: Any])?["url"] as? String) ??
+                             (((json["hd_profile_pic_versions"] as? [[String: Any]])?.first)?["url"] as? String)
+                let picURL = rawPic.flatMap { URL(string: $0.replacingOccurrences(of: "&amp;", with: "&")) }
+                if !uname.isEmpty {
+                    let user = InstagramUser(
+                        id: session.userID,
+                        username: uname,
+                        fullName: fullName,
+                        profilePicURL: picURL ?? sessionManager.currentUserProfile?.profilePicURL,
+                        isVerified: isVerified
+                    )
+                    await MainActor.run {
+                        sessionManager.updateUserProfile(user)
+                    }
+                    if picURL != nil {
+                        return
+                    }
+                }
+            }
+
+            // Tentativo 2: Risolvi direttamente tramite la pagina profilo utente con AnonymousMediaService
+            if let uname = (sessionManager.currentUserProfile?.username ?? knownUsername), !uname.isEmpty {
                 let candidate = InstagramUser(id: session.userID, username: uname)
                 let resolved = await AnonymousMediaService.shared.resolveProfile(user: candidate, session: session)
                 if let pic = resolved.profilePicURL {
@@ -330,132 +359,13 @@ public struct DashboardView: View {
                 }
             }
 
-            // Tentativo 1: API Ufficiale (web_profile_info o accounts/current_user)
+            // Tentativo 3: API Ufficiale (web_profile_info o accounts/current_user)
             if let profile = try? await InstagramAPIService.shared.fetchCurrentUserProfile(session: session, username: knownUsername) {
-                await MainActor.run {
-                    sessionManager.updateUserProfile(profile)
-                }
                 if profile.profilePicURL != nil {
-                    return
-                }
-                // Se abbiamo ottenuto l'username ma non l'avatar, risolvilo tramite la pagina profilo
-                if !profile.username.isEmpty {
-                    let resolved = await AnonymousMediaService.shared.resolveProfile(user: profile, session: session)
-                    if let pic = resolved.profilePicURL {
-                        let fullUser = InstagramUser(
-                            id: profile.id,
-                            username: profile.username,
-                            fullName: resolved.fullName.isEmpty ? profile.fullName : resolved.fullName,
-                            profilePicURL: pic,
-                            isVerified: profile.isVerified || resolved.isVerified,
-                            isPrivate: profile.isPrivate,
-                            mediaCount: resolved.postsCount
-                        )
-                        await MainActor.run {
-                            sessionManager.updateUserProfile(fullUser)
-                        }
-                        return
-                    }
-                }
-            }
-
-            // Tentativo 2: WebKit autenticato con credenziali live
-            if let jsonString = await InstagramWebBridge.shared.fetchCurrentUserProfile(userID: session.userID, username: knownUsername),
-               let data = jsonString.data(using: .utf8),
-               let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any] {
-                let uname = (json["username"] as? String) ?? (knownUsername ?? "")
-                let fullName = (json["full_name"] as? String) ?? (json["first_name"] as? String) ?? ""
-                let isVerified = (json["is_verified"] as? Bool) ?? false
-                let rawPic = (json["profile_pic_url_hd"] as? String) ??
-                             (json["profile_pic_url"] as? String) ??
-                             ((json["hd_profile_pic_url_info"] as? [String: Any])?["url"] as? String) ??
-                             (((json["hd_profile_pic_versions"] as? [[String: Any]])?.first)?["url"] as? String)
-                let picURL = rawPic.flatMap { URL(string: $0.replacingOccurrences(of: "&amp;", with: "&")) }
-                if !uname.isEmpty {
-                    let user = InstagramUser(
-                        id: session.userID,
-                        username: uname,
-                        fullName: fullName,
-                        profilePicURL: picURL,
-                        isVerified: isVerified
-                    )
                     await MainActor.run {
-                        sessionManager.updateUserProfile(user)
+                        sessionManager.updateUserProfile(profile)
                     }
-                    if picURL != nil {
-                        return
-                    }
-                    // Risolvi avatar tramite navigazione profilo
-                    let resolved = await AnonymousMediaService.shared.resolveProfile(user: user, session: session)
-                    if let pic = resolved.profilePicURL {
-                        let fullUser = InstagramUser(
-                            id: session.userID,
-                            username: uname,
-                            fullName: resolved.fullName.isEmpty ? fullName : resolved.fullName,
-                            profilePicURL: pic,
-                            isVerified: isVerified || resolved.isVerified,
-                            isPrivate: resolved.isPrivate,
-                            mediaCount: resolved.postsCount
-                        )
-                        await MainActor.run {
-                            sessionManager.updateUserProfile(fullUser)
-                        }
-                        return
-                    }
-                }
-            }
-
-            // Tentativo 3: Attesa e re-interrogazione via WebBridge per dare tempo al bridge di agganciarsi
-            try? await Task.sleep(nanoseconds: 1_200_000_000)
-            if let profile = try? await InstagramAPIService.shared.fetchCurrentUserProfile(session: session, username: knownUsername) {
-                await MainActor.run {
-                    sessionManager.updateUserProfile(profile)
-                }
-                if profile.profilePicURL != nil {
                     return
-                }
-            }
-            if let jsonString = await InstagramWebBridge.shared.fetchCurrentUserProfile(userID: session.userID, username: knownUsername),
-               let data = jsonString.data(using: .utf8),
-               let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any] {
-                let uname = (json["username"] as? String) ?? (knownUsername ?? "")
-                let fullName = (json["full_name"] as? String) ?? (json["first_name"] as? String) ?? ""
-                let isVerified = (json["is_verified"] as? Bool) ?? false
-                let rawPic = (json["profile_pic_url_hd"] as? String) ??
-                             (json["profile_pic_url"] as? String) ??
-                             ((json["hd_profile_pic_url_info"] as? [String: Any])?["url"] as? String) ??
-                             (((json["hd_profile_pic_versions"] as? [[String: Any]])?.first)?["url"] as? String)
-                let picURL = rawPic.flatMap { URL(string: $0.replacingOccurrences(of: "&amp;", with: "&")) }
-                if !uname.isEmpty {
-                    let user = InstagramUser(
-                        id: session.userID,
-                        username: uname,
-                        fullName: fullName,
-                        profilePicURL: picURL,
-                        isVerified: isVerified
-                    )
-                    await MainActor.run {
-                        sessionManager.updateUserProfile(user)
-                    }
-                    if picURL != nil {
-                        return
-                    }
-                }
-            }
-
-            // Tentativo 4: Fallback sicuro su username in cache se disponibile
-            await MainActor.run {
-                if sessionManager.currentUserProfile == nil {
-                    let cached = UserDefaults.standard.string(forKey: "com.instagramwatcher.cached_username")
-                    let uname = (cached != nil && !cached!.isEmpty) ? cached! : "Instagram User"
-                    let fallbackUser = InstagramUser(
-                        id: session.userID,
-                        username: uname,
-                        fullName: "",
-                        profilePicURL: nil,
-                        isVerified: false
-                    )
-                    sessionManager.updateUserProfile(fallbackUser)
                 }
             }
         }

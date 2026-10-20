@@ -52,7 +52,7 @@ public struct AnonymousMediaViewerSheet: View {
                     // Barra Anonimato Stealth
                     stealthNoticeBanner
 
-                    ScrollView(showsIndicators: false) {
+                    ScrollView(showsIndicators: true) {
                         VStack(spacing: 14) {
                             // Header Profilo in stile Instagram
                             instagramProfileHeader
@@ -1329,20 +1329,6 @@ public struct InstagramPostDetailSheet: View {
                                     }
                                     .tabViewStyle(PageTabViewStyle(indexDisplayMode: .never))
                                     .frame(height: 390)
-                                    .gesture(
-                                        DragGesture(minimumDistance: 20)
-                                            .onEnded { value in
-                                                if value.translation.width < -35 && carouselIndex < currentPost.carouselItems.count - 1 {
-                                                    withAnimation(.easeInOut(duration: 0.22)) {
-                                                        carouselIndex += 1
-                                                    }
-                                                } else if value.translation.width > 35 && carouselIndex > 0 {
-                                                    withAnimation(.easeInOut(duration: 0.22)) {
-                                                        carouselIndex -= 1
-                                                    }
-                                                }
-                                            }
-                                    )
 
                                     // Frecce di scorrimento laterali per facilitare lo swipe su tutti i dispositivi
                                     HStack {

@@ -285,6 +285,18 @@ public final class AnonymousMediaService: @unchecked Sendable {
                      ((json["hd_profile_pic_url_info"] as? [String: Any])?["url"] as? String)
         if let u = cleanMediaURL(rawPic) {
             picURL = u
+        } else if let items = (json["items"] as? [[String: Any]]) ?? ((json["data"] as? [String: Any])?["items"] as? [[String: Any]]) {
+            for item in items {
+                if let udict = item["user"] as? [String: Any] {
+                    let itemPic = (udict["profile_pic_url_hd"] as? String) ??
+                                  (udict["profile_pic_url"] as? String) ??
+                                  ((udict["hd_profile_pic_url_info"] as? [String: Any])?["url"] as? String)
+                    if let u = cleanMediaURL(itemPic) {
+                        picURL = u
+                        break
+                    }
+                }
+            }
         }
 
         if !posts.isEmpty || json["dom_posts"] != nil {
@@ -650,11 +662,27 @@ public final class AnonymousMediaService: @unchecked Sendable {
         let activeEndCursor = storedEndCursor ?? getPaginationCursor(userIdOrName: cleanUsername).endCursor
         let activeNextMaxId = storedNextMaxId ?? getPaginationCursor(userIdOrName: cleanUsername).nextMaxId
 
-        // Tier 1: Tramite WebKit scroll e in-page GraphQL con cursore
+        let lastCode = existingShortcodes.last ?? ""
+        let numericLastId = shortcodeToNumericID(lastCode) ?? (lastCode.allSatisfy({ $0.isNumber }) ? lastCode : nil)
+
+        // Costruisci la lista di candidate max_id per l'API feed
+        var candidateMaxIds: [String] = []
+        if let mid = activeNextMaxId, !mid.isEmpty {
+            candidateMaxIds.append(mid)
+        }
+        if let num = numericLastId, !num.isEmpty {
+            candidateMaxIds.append(num)
+            if !userID.isEmpty {
+                candidateMaxIds.append("\(num)_\(userID)")
+            }
+        }
+
+        // Tier 1: Tramite WebKit Feed API in-page, GraphQL e scroll
         if let bridgeString = await InstagramWebBridge.shared.fetchMorePosts(
             username: cleanUsername,
             existingShortcodes: existingShortcodes,
             cursor: activeEndCursor,
+            maxId: candidateMaxIds.first,
             userID: userID
         ),
            let data = bridgeString.data(using: .utf8),
@@ -676,20 +704,6 @@ public final class AnonymousMediaService: @unchecked Sendable {
         }
 
         let cookieHeader = await InstagramSessionManager.shared.getLiveCookieHeader()
-        let lastCode = existingShortcodes.last ?? ""
-        let numericLastId = shortcodeToNumericID(lastCode) ?? (lastCode.allSatisfy({ $0.isNumber }) ? lastCode : nil)
-
-        // Costruisci la lista di candidate max_id per l'API feed
-        var candidateMaxIds: [String] = []
-        if let mid = activeNextMaxId, !mid.isEmpty {
-            candidateMaxIds.append(mid)
-        }
-        if let num = numericLastId, !num.isEmpty {
-            candidateMaxIds.append(num)
-            if !userID.isEmpty {
-                candidateMaxIds.append("\(num)_\(userID)")
-            }
-        }
 
         // Tier 2: GraphQL query con query_hash per timeline continua
         if let cur = activeEndCursor, !cur.isEmpty, !userID.isEmpty {
