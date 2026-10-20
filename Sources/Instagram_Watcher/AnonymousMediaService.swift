@@ -132,6 +132,13 @@ public final class AnonymousMediaService: Sendable {
 
     private init() {}
 
+    /// Sanitizza le URL dei media Meta CDN rimuovendo entità HTML (&amp; -> &) e spazi non validi
+    public func cleanMediaURL(_ raw: String?) -> URL? {
+        guard let raw = raw?.trimmingCharacters(in: .whitespacesAndNewlines), !raw.isEmpty else { return nil }
+        let clean = raw.replacingOccurrences(of: "&amp;", with: "&")
+        return URL(string: clean)
+    }
+
     // MARK: - Recupero Vassoio Storie Attive (Reels Tray) per la lista
 
     /// Recupera la mappa di tutti gli account che hanno storie attive al momento
@@ -246,7 +253,10 @@ public final class AnonymousMediaService: Sendable {
         let posts = parseAnyPostsFromJSON(json)
         let isPrivate = json["is_private"] as? Bool ?? defaultUser.isPrivate
         var picURL = defaultUser.profilePicURL
-        if let picStr = json["profile_pic_url"] as? String, let u = URL(string: picStr) {
+        let rawPic = (json["profile_pic_url_hd"] as? String) ??
+                     (json["profile_pic_url"] as? String) ??
+                     ((json["hd_profile_pic_url_info"] as? [String: Any])?["url"] as? String)
+        if let u = cleanMediaURL(rawPic) {
             picURL = u
         }
 
@@ -277,12 +287,15 @@ public final class AnonymousMediaService: Sendable {
         let biography = userDict["biography"] as? String ?? ""
         let isPrivate = userDict["is_private"] as? Bool ?? false
         let isVerified = userDict["is_verified"] as? Bool ?? false
-        let followedByViewer = followedLocally || (userDict["followed_by_viewer"] as? Bool ?? false)
+        let followedByViewer = followedLocally || 
+                               (userDict["followed_by_viewer"] as? Bool ?? false) ||
+                               ((userDict["friendship_status"] as? [String: Any])?["following"] as? Bool ?? false)
 
-        var picURL: URL? = nil
-        if let picStr = userDict["profile_pic_url_hd"] as? String ?? userDict["profile_pic_url"] as? String {
-            picURL = URL(string: picStr)
-        }
+        let rawPic = (userDict["profile_pic_url_hd"] as? String) ??
+                     (userDict["profile_pic_url"] as? String) ??
+                     ((userDict["hd_profile_pic_url_info"] as? [String: Any])?["url"] as? String) ??
+                     (((userDict["hd_profile_pic_versions"] as? [[String: Any]])?.first)?["url"] as? String)
+        let picURL = cleanMediaURL(rawPic)
 
         let followersCount = (userDict["edge_followed_by"] as? [String: Any])?["count"] as? Int ?? (userDict["follower_count"] as? Int) ?? 0
         let followingCount = (userDict["edge_follow"] as? [String: Any])?["count"] as? Int ?? (userDict["following_count"] as? Int) ?? 0
@@ -299,7 +312,21 @@ public final class AnonymousMediaService: Sendable {
                     }
                 }
             }
-        } else if let items = userDict["items"] as? [[String: Any]] {
+        }
+        
+        // Estrai anche i video/reels da edge_felix_video_timeline
+        if let felix = userDict["edge_felix_video_timeline"] as? [String: Any],
+           let edges = felix["edges"] as? [[String: Any]] {
+            for edge in edges {
+                if let node = edge["node"] as? [String: Any], let p = parseTimelineMediaNode(node) {
+                    if !parsedPosts.contains(where: { $0.id == p.id }) {
+                        parsedPosts.append(p)
+                    }
+                }
+            }
+        }
+
+        if parsedPosts.isEmpty, let items = userDict["items"] as? [[String: Any]] {
             parsedPosts = parseItemsArray(items)
             postsCount = parsedPosts.count
         }
@@ -370,12 +397,15 @@ public final class AnonymousMediaService: Sendable {
             let biography = userDict["biography"] as? String ?? ""
             let isPrivate = userDict["is_private"] as? Bool ?? false
             let isVerified = userDict["is_verified"] as? Bool ?? false
-            let followedByViewer = isFollowedLocally || ((userDict["friendship_status"] as? [String: Any])?["following"] as? Bool ?? false)
+            let followedByViewer = isFollowedLocally || 
+                                   (userDict["followed_by_viewer"] as? Bool ?? false) ||
+                                   ((userDict["friendship_status"] as? [String: Any])?["following"] as? Bool ?? false)
 
-            var picURL: URL? = nil
-            if let picStr = userDict["profile_pic_url_hd"] as? String ?? userDict["profile_pic_url"] as? String {
-                picURL = URL(string: picStr)
-            }
+            let rawPic = (userDict["profile_pic_url_hd"] as? String) ??
+                         (userDict["profile_pic_url"] as? String) ??
+                         ((userDict["hd_profile_pic_url_info"] as? [String: Any])?["url"] as? String) ??
+                         (((userDict["hd_profile_pic_versions"] as? [[String: Any]])?.first)?["url"] as? String)
+            let picURL = cleanMediaURL(rawPic)
 
             let followers = userDict["follower_count"] as? Int ?? 0
             let following = userDict["following_count"] as? Int ?? 0
@@ -488,9 +518,9 @@ public final class AnonymousMediaService: Sendable {
                let candidates = imgVersions["candidates"] as? [[String: Any]],
                let firstCandidate = candidates.first,
                let urlStr = firstCandidate["url"] as? String {
-                imgURL = URL(string: urlStr)
+                imgURL = cleanMediaURL(urlStr)
             } else if let urlStr = item["display_url"] as? String {
-                imgURL = URL(string: urlStr)
+                imgURL = cleanMediaURL(urlStr)
             }
 
             var vidURL: URL? = nil
@@ -498,9 +528,9 @@ public final class AnonymousMediaService: Sendable {
                let videoVersions = item["video_versions"] as? [[String: Any]],
                let firstVideo = videoVersions.first,
                let urlStr = firstVideo["url"] as? String {
-                vidURL = URL(string: urlStr)
+                vidURL = cleanMediaURL(urlStr)
             } else if mediaType == 2, let urlStr = item["video_url"] as? String {
-                vidURL = URL(string: urlStr)
+                vidURL = cleanMediaURL(urlStr)
             }
 
             stories.append(InstagramStoryItem(
@@ -535,9 +565,11 @@ public final class AnonymousMediaService: Sendable {
         var endpoints: [String] = []
 
         if let numericID = Int64(userID), numericID > 0 {
+            endpoints.append("https://www.instagram.com/api/v1/feed/user/\(userID)/")
             endpoints.append("https://www.instagram.com/api/v1/feed/user/\(userID)/?count=18")
+            endpoints.append("https://i.instagram.com/api/v1/feed/user/\(userID)/")
+            endpoints.append("https://i.instagram.com/api/v1/feed/user/\(userID)/?count=18")
         }
-        endpoints.append("https://www.instagram.com/api/v1/feed/user/\(cleanUsername)/username/?count=18")
         endpoints.append("https://www.instagram.com/api/v1/users/web_profile_info/?username=\(cleanUsername)")
         endpoints.append("https://i.instagram.com/api/v1/users/web_profile_info/?username=\(cleanUsername)")
 
@@ -607,10 +639,7 @@ public final class AnonymousMediaService: Sendable {
                 endpoints.append("https://i.instagram.com/api/v1/feed/user/\(userID)/?max_id=\(maxId)&count=24")
             }
             endpoints.append("https://www.instagram.com/api/v1/feed/user/\(userID)/?count=24")
-        }
-
-        if let maxId = maxIdParam {
-            endpoints.append("https://www.instagram.com/api/v1/feed/user/\(cleanUsername)/username/?max_id=\(maxId)&count=24")
+            endpoints.append("https://i.instagram.com/api/v1/feed/user/\(userID)/?count=24")
         }
 
         for ep in endpoints {
@@ -647,16 +676,45 @@ public final class AnonymousMediaService: Sendable {
         }
 
         // Formato 3: GraphQL edge_owner_to_timeline_media
-        if let user = (json["data"] as? [String: Any])?["user"] as? [String: Any] ?? (json["graphql"] as? [String: Any])?["user"] as? [String: Any] ?? json["user"] as? [String: Any],
-           let timeline = user["edge_owner_to_timeline_media"] as? [String: Any],
-           let edges = timeline["edges"] as? [[String: Any]] {
+        if let user = (json["data"] as? [String: Any])?["user"] as? [String: Any] ?? (json["graphql"] as? [String: Any])?["user"] as? [String: Any] ?? json["user"] as? [String: Any] {
             var posts: [InstagramPostItem] = []
-            for edge in edges {
-                if let node = edge["node"] as? [String: Any], let p = parseTimelineMediaNode(node) {
-                    posts.append(p)
+            if let timeline = user["edge_owner_to_timeline_media"] as? [String: Any],
+               let edges = timeline["edges"] as? [[String: Any]] {
+                for edge in edges {
+                    if let node = edge["node"] as? [String: Any], let p = parseTimelineMediaNode(node) {
+                        posts.append(p)
+                    }
+                }
+            }
+            // Includi anche edge_felix_video_timeline (Reels e video post)
+            if let felix = user["edge_felix_video_timeline"] as? [String: Any],
+               let edges = felix["edges"] as? [[String: Any]] {
+                for edge in edges {
+                    if let node = edge["node"] as? [String: Any], let p = parseTimelineMediaNode(node) {
+                        if !posts.contains(where: { $0.id == p.id }) {
+                            posts.append(p)
+                        }
+                    }
                 }
             }
             if !posts.isEmpty { return posts }
+        }
+
+        // Formato 3b: Connessioni GraphQL dirette in dataDict
+        if let dataDict = json["data"] as? [String: Any] {
+            for (k, val) in dataDict {
+                if (k.contains("user_timeline") || k.contains("feed")),
+                   let conn = val as? [String: Any],
+                   let edges = conn["edges"] as? [[String: Any]] {
+                    var posts: [InstagramPostItem] = []
+                    for edge in edges {
+                        if let node = edge["node"] as? [String: Any], let p = parseTimelineMediaNode(node) {
+                            posts.append(p)
+                        }
+                    }
+                    if !posts.isEmpty { return posts }
+                }
+            }
         }
 
         // Formato 4: dom_posts estratti dal DOM reale del browser WebKit
@@ -665,7 +723,7 @@ public final class AnonymousMediaService: Sendable {
             for item in domPosts {
                 let id = item["id"] as? String ?? UUID().uuidString
                 let mediaType = item["media_type"] as? Int ?? 1
-                let imgURL = (item["display_url"] as? String).flatMap { URL(string: $0) }
+                let imgURL = cleanMediaURL(item["display_url"] as? String)
                 let caption = item["caption"] as? String ?? ""
                 let likeCount = item["like_count"] as? Int ?? 0
 
@@ -716,9 +774,9 @@ public final class AnonymousMediaService: Sendable {
                let candidates = imgVersions["candidates"] as? [[String: Any]],
                let firstCandidate = candidates.first,
                let urlStr = firstCandidate["url"] as? String {
-                imgURL = URL(string: urlStr)
+                imgURL = cleanMediaURL(urlStr)
             } else if let urlStr = item["display_url"] as? String ?? item["thumbnail_src"] as? String {
-                imgURL = URL(string: urlStr)
+                imgURL = cleanMediaURL(urlStr)
             }
 
             var vidURL: URL? = nil
@@ -726,9 +784,9 @@ public final class AnonymousMediaService: Sendable {
                let videoVersions = item["video_versions"] as? [[String: Any]],
                let firstVideo = videoVersions.first,
                let urlStr = firstVideo["url"] as? String {
-                vidURL = URL(string: urlStr)
+                vidURL = cleanMediaURL(urlStr)
             } else if mediaType == 2, let urlStr = item["video_url"] as? String {
-                vidURL = URL(string: urlStr)
+                vidURL = cleanMediaURL(urlStr)
             }
 
             var carouselItems: [InstagramMediaSubItem] = []
@@ -741,16 +799,16 @@ public final class AnonymousMediaService: Sendable {
                        let subCands = subVersions["candidates"] as? [[String: Any]],
                        let first = subCands.first,
                        let s = first["url"] as? String {
-                        subImg = URL(string: s)
+                        subImg = cleanMediaURL(s)
                     } else if let s = subItem["display_url"] as? String {
-                        subImg = URL(string: s)
+                        subImg = cleanMediaURL(s)
                     }
                     var subVid: URL? = nil
                     if subType == 2,
                        let vids = subItem["video_versions"] as? [[String: Any]],
                        let firstVid = vids.first,
                        let s = firstVid["url"] as? String {
-                        subVid = URL(string: s)
+                        subVid = cleanMediaURL(s)
                     }
                     carouselItems.append(InstagramMediaSubItem(
                         id: subId,
@@ -796,18 +854,18 @@ public final class AnonymousMediaService: Sendable {
 
         var imgURL: URL? = nil
         if let displayUrlStr = node["display_url"] as? String {
-            imgURL = URL(string: displayUrlStr)
+            imgURL = cleanMediaURL(displayUrlStr)
         } else if let str = node["thumbnail_src"] as? String ?? node["thumbnail_url"] as? String {
-            imgURL = URL(string: str)
+            imgURL = cleanMediaURL(str)
         } else if let resources = node["display_resources"] as? [[String: Any]],
                   let last = resources.last,
                   let str = last["src"] as? String {
-            imgURL = URL(string: str)
+            imgURL = cleanMediaURL(str)
         }
 
         var vidURL: URL? = nil
         if isVideo, let videoUrlStr = node["video_url"] as? String {
-            vidURL = URL(string: videoUrlStr)
+            vidURL = cleanMediaURL(videoUrlStr)
         }
 
         var captionText = ""
@@ -834,9 +892,9 @@ public final class AnonymousMediaService: Sendable {
                     let childIsVideo = childNode["is_video"] as? Bool ?? false
                     var childImg: URL? = nil
                     if let str = childNode["display_url"] as? String ?? childNode["thumbnail_src"] as? String {
-                        childImg = URL(string: str)
+                        childImg = cleanMediaURL(str)
                     }
-                    let childVid = (childNode["video_url"] as? String).flatMap { URL(string: $0) }
+                    let childVid = (childNode["video_url"] as? String).flatMap { cleanMediaURL($0) }
                     carouselItems.append(InstagramMediaSubItem(
                         id: childId,
                         imageURL: childImg,
@@ -866,22 +924,24 @@ public final class AnonymousMediaService: Sendable {
     // MARK: - Header Applicator
 
     private func applyHeaders(to request: inout URLRequest, session: InstagramSession, cookieHeader: String, referer: String) {
-        request.httpShouldHandleCookies = false
+        request.httpShouldHandleCookies = true
         let finalCookie = cookieHeader.isEmpty ? session.cookieHeader : cookieHeader
         request.setValue(finalCookie, forHTTPHeaderField: "Cookie")
 
-        var csrf = session.csrfToken
-        if csrf.isEmpty {
-            for part in finalCookie.components(separatedBy: ";") {
-                let pair = part.trimmingCharacters(in: .whitespaces).components(separatedBy: "=")
-                if pair.count == 2 && pair[0] == "csrftoken" {
-                    csrf = pair[1]
+        var csrf: String? = nil
+        for part in finalCookie.components(separatedBy: ";") {
+            let pair = part.trimmingCharacters(in: .whitespaces).components(separatedBy: "=")
+            if pair.count >= 2 && pair[0] == "csrftoken" {
+                let token = pair.dropFirst().joined(separator: "=")
+                if !token.isEmpty {
+                    csrf = token
                     break
                 }
             }
         }
-        if !csrf.isEmpty {
-            request.setValue(csrf, forHTTPHeaderField: "x-csrftoken")
+        let effectiveCSRF = csrf ?? session.csrfToken
+        if !effectiveCSRF.isEmpty {
+            request.setValue(effectiveCSRF, forHTTPHeaderField: "x-csrftoken")
         }
 
         request.setValue("936619743392459", forHTTPHeaderField: "x-ig-app-id")

@@ -75,6 +75,36 @@ public struct DashboardView: View {
                     }
                 }
             }
+            .task {
+                if sessionManager.isLoggedIn {
+                    InstagramWebBridge.shared.prepare()
+                    loadProfileIfNeeded()
+                    await trackerService.refreshActiveStories()
+                }
+            }
+            .onAppear {
+                withAnimation(.easeInOut(duration: 1.4).repeatForever(autoreverses: true)) {
+                    pulseAnimation = true
+                }
+                if sessionManager.isLoggedIn {
+                    InstagramWebBridge.shared.prepare()
+                    if sessionManager.currentUserProfile == nil || sessionManager.currentUserProfile?.profilePicURL == nil {
+                        loadProfileIfNeeded()
+                    }
+                    Task {
+                        await trackerService.refreshActiveStories()
+                    }
+                }
+            }
+            .onChange(of: sessionManager.isLoggedIn) { _, loggedIn in
+                if loggedIn {
+                    InstagramWebBridge.shared.prepare()
+                    loadProfileIfNeeded()
+                    Task {
+                        await trackerService.refreshActiveStories()
+                    }
+                }
+            }
             .navigationTitle(loc("app.title"))
             .toolbar {
                 ToolbarItem(placement: .navigationBarTrailing) {
@@ -146,20 +176,6 @@ public struct DashboardView: View {
                 AnonymousSearchSheet()
             }
         }
-        .onAppear {
-            withAnimation(.easeInOut(duration: 1.4).repeatForever(autoreverses: true)) {
-                pulseAnimation = true
-            }
-            if sessionManager.isLoggedIn {
-                InstagramWebBridge.shared.prepare()
-                Task {
-                    await trackerService.refreshActiveStories()
-                }
-            }
-            if sessionManager.isLoggedIn && sessionManager.currentUserProfile == nil {
-                loadProfileIfNeeded()
-            }
-        }
     }
 
     // MARK: - Componenti Grafici Dashboard
@@ -218,13 +234,18 @@ public struct DashboardView: View {
                         .foregroundColor(.secondary)
                         .lineLimit(1)
                 } else {
-                    HStack(spacing: 6) {
-                        ProgressView()
-                            .scaleEffect(0.7)
-                        Text(loc("status.loading_profile"))
-                            .font(.system(size: 13, weight: .semibold))
-                            .foregroundColor(.secondary)
+                    Button {
+                        loadProfileIfNeeded()
+                    } label: {
+                        HStack(spacing: 6) {
+                            ProgressView()
+                                .scaleEffect(0.7)
+                            Text(loc("status.loading_profile"))
+                                .font(.system(size: 13, weight: .semibold))
+                                .foregroundColor(.secondary)
+                        }
                     }
+                    .buttonStyle(PlainButtonStyle())
 
                     Text(loc("app.title"))
                         .font(.system(size: 11))
@@ -281,23 +302,29 @@ public struct DashboardView: View {
 
     private func loadProfileIfNeeded() {
         guard let session = sessionManager.currentSession else { return }
+        let knownUsername = sessionManager.currentUserProfile?.username ?? UserDefaults.standard.string(forKey: "com.instagramwatcher.cached_username")
         Task {
-            // Tentativo 1: API Ufficiale
-            if let profile = try? await InstagramAPIService.shared.fetchCurrentUserProfile(session: session) {
+            // Tentativo 1: API Ufficiale (web_profile_info o accounts/current_user)
+            if let profile = try? await InstagramAPIService.shared.fetchCurrentUserProfile(session: session, username: knownUsername) {
                 await MainActor.run {
                     sessionManager.updateUserProfile(profile)
                 }
-                return
+                if profile.profilePicURL != nil {
+                    return
+                }
             }
-            // Tentativo 2: WebKit autenticato
-            if let jsonString = await InstagramWebBridge.shared.fetchCurrentUserProfile(userID: session.userID),
+            // Tentativo 2: WebKit autenticato con credenziali live
+            if let jsonString = await InstagramWebBridge.shared.fetchCurrentUserProfile(userID: session.userID, username: knownUsername),
                let data = jsonString.data(using: .utf8),
                let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any] {
-                let uname = (json["username"] as? String) ?? ""
-                let fullName = (json["full_name"] as? String) ?? ""
+                let uname = (json["username"] as? String) ?? (knownUsername ?? "")
+                let fullName = (json["full_name"] as? String) ?? (json["first_name"] as? String) ?? ""
                 let isVerified = (json["is_verified"] as? Bool) ?? false
-                let picURLStr = (json["profile_pic_url"] as? String)
-                let picURL = picURLStr != nil ? URL(string: picURLStr!) : nil
+                let rawPic = (json["profile_pic_url_hd"] as? String) ??
+                             (json["profile_pic_url"] as? String) ??
+                             ((json["hd_profile_pic_url_info"] as? [String: Any])?["url"] as? String) ??
+                             (((json["hd_profile_pic_versions"] as? [[String: Any]])?.first)?["url"] as? String)
+                let picURL = rawPic.flatMap { URL(string: $0.replacingOccurrences(of: "&amp;", with: "&")) }
                 if !uname.isEmpty {
                     let user = InstagramUser(
                         id: session.userID,
@@ -309,7 +336,63 @@ public struct DashboardView: View {
                     await MainActor.run {
                         sessionManager.updateUserProfile(user)
                     }
+                    if picURL != nil {
+                        return
+                    }
+                }
+            }
+
+            // Tentativo 3: Attesa e re-interrogazione via WebBridge per dare tempo al bridge di agganciarsi
+            try? await Task.sleep(nanoseconds: 1_200_000_000)
+            if let profile = try? await InstagramAPIService.shared.fetchCurrentUserProfile(session: session, username: knownUsername) {
+                await MainActor.run {
+                    sessionManager.updateUserProfile(profile)
+                }
+                if profile.profilePicURL != nil {
                     return
+                }
+            }
+            if let jsonString = await InstagramWebBridge.shared.fetchCurrentUserProfile(userID: session.userID, username: knownUsername),
+               let data = jsonString.data(using: .utf8),
+               let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any] {
+                let uname = (json["username"] as? String) ?? (knownUsername ?? "")
+                let fullName = (json["full_name"] as? String) ?? (json["first_name"] as? String) ?? ""
+                let isVerified = (json["is_verified"] as? Bool) ?? false
+                let rawPic = (json["profile_pic_url_hd"] as? String) ??
+                             (json["profile_pic_url"] as? String) ??
+                             ((json["hd_profile_pic_url_info"] as? [String: Any])?["url"] as? String) ??
+                             (((json["hd_profile_pic_versions"] as? [[String: Any]])?.first)?["url"] as? String)
+                let picURL = rawPic.flatMap { URL(string: $0.replacingOccurrences(of: "&amp;", with: "&")) }
+                if !uname.isEmpty {
+                    let user = InstagramUser(
+                        id: session.userID,
+                        username: uname,
+                        fullName: fullName,
+                        profilePicURL: picURL,
+                        isVerified: isVerified
+                    )
+                    await MainActor.run {
+                        sessionManager.updateUserProfile(user)
+                    }
+                    if picURL != nil {
+                        return
+                    }
+                }
+            }
+
+            // Tentativo 4: Fallback sicuro su username in cache se disponibile
+            await MainActor.run {
+                if sessionManager.currentUserProfile == nil {
+                    let cached = UserDefaults.standard.string(forKey: "com.instagramwatcher.cached_username")
+                    let uname = (cached != nil && !cached!.isEmpty) ? cached! : "Instagram User"
+                    let fallbackUser = InstagramUser(
+                        id: session.userID,
+                        username: uname,
+                        fullName: "",
+                        profilePicURL: nil,
+                        isVerified: false
+                    )
+                    sessionManager.updateUserProfile(fallbackUser)
                 }
             }
         }

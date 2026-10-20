@@ -18,9 +18,29 @@ public final class InstagramWebBridge: NSObject, WKNavigationDelegate {
         super.init()
     }
 
+    private func attachToWindowIfNeeded(_ wv: WKWebView) {
+        guard wv.superview == nil else { return }
+        let window = UIApplication.shared.connectedScenes
+            .compactMap({ $0 as? UIWindowScene })
+            .flatMap({ $0.windows })
+            .first(where: { $0.isKeyWindow }) ??
+            UIApplication.shared.connectedScenes
+            .compactMap({ $0 as? UIWindowScene })
+            .flatMap({ $0.windows })
+            .first
+        if let win = window {
+            wv.frame = CGRect(x: -2000, y: -2000, width: 375, height: 667)
+            wv.alpha = 0.01
+            win.addSubview(wv)
+        }
+    }
+
     /// Prepara e aggancia la webView invisibile alla gerarchia della finestra off-screen
     public func prepare() {
-        guard webView == nil else { return }
+        if let existing = webView {
+            attachToWindowIfNeeded(existing)
+            return
+        }
 
         let config = WKWebViewConfiguration()
         config.websiteDataStore = WKWebsiteDataStore.default()
@@ -29,160 +49,297 @@ public final class InstagramWebBridge: NSObject, WKNavigationDelegate {
         wv.navigationDelegate = self
         wv.customUserAgent = "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1"
 
-        if let window = UIApplication.shared.connectedScenes
-            .compactMap({ $0 as? UIWindowScene })
-            .flatMap({ $0.windows })
-            .first(where: { $0.isKeyWindow }) {
-            wv.frame = CGRect(x: -2000, y: -2000, width: 375, height: 667)
-            wv.alpha = 0.01
-            window.addSubview(wv)
-        }
+        attachToWindowIfNeeded(wv)
 
         self.webView = wv
+        if let homeURL = URL(string: "https://www.instagram.com/") {
+            wv.load(URLRequest(url: homeURL))
+        }
+    }
+
+    /// Attende che la webView abbia completato l'eventuale navigazione in corso
+    private func waitForWebViewReady(_ wv: WKWebView, timeout: TimeInterval = 3.5) async {
+        guard wv.isLoading else { return }
+        let start = Date()
+        while wv.isLoading && Date().timeIntervalSince(start) < timeout {
+            try? await Task.sleep(nanoseconds: 100_000_000)
+        }
     }
 
     // MARK: - Fetching Profilo e Post con Navigazione Diretta
 
-    /// Recupera il profilo e/o i post navigando direttamente sulla pagina del profilo utente
+    /// Recupera il profilo e/o i post navigando o interrogando in-page direttamente le API WebKit
     public func fetchProfileAndPosts(username: String, userID: String) async -> String? {
         let clean = username.trimmingCharacters(in: .whitespacesAndNewlines).replacingOccurrences(of: "@", with: "")
         guard !clean.isEmpty else { return nil }
 
         prepare()
         guard let wv = webView else { return nil }
-        guard let targetURL = URL(string: "https://www.instagram.com/\(clean)/") else { return nil }
 
-        // Avvia il caricamento della pagina del profilo solo se non siamo già su di esso
+        // Attendi che l'eventuale caricamento iniziale sia completato
+        await waitForWebViewReady(wv, timeout: 2.5)
+
+        // 1. Esecuzione immediata ultra-rapida via fetch in-page (~100ms) senza navigare o ricaricare la WebView
+        if let direct = await executeInPageFetch(wv, username: clean, userID: userID) {
+            return direct
+        }
+
+        // 2. Se non ha ancora risposto, naviga sul profilo utente con attesa garantita di caricamento
+        guard let targetURL = URL(string: "https://www.instagram.com/\(clean)/") else { return nil }
         let currentPath = wv.url?.path.lowercased().trimmingCharacters(in: CharacterSet(charactersIn: "/")) ?? ""
         if currentPath != clean.lowercased() {
             wv.load(URLRequest(url: targetURL))
+            try? await Task.sleep(nanoseconds: 250_000_000)
+            await waitForWebViewReady(wv, timeout: 5.0)
+            try? await Task.sleep(nanoseconds: 300_000_000)
         }
 
-        // Polling rapido: estrae i dati solo se la pagina corrisponde all'utente richiesto
-        for _ in 0..<16 { // Fino a 4 secondi massimi
-            try? await Task.sleep(nanoseconds: 250_000_000)
+        // 3. Riprova fetch in-page con il context della pagina del profilo utente
+        if let direct = await executeInPageFetch(wv, username: clean, userID: userID) {
+            return direct
+        }
+
+        // 4. Polling rapido: estrae i dati solo se la pagina corrisponde all'utente richiesto
+        for _ in 0..<12 {
             if let result = await extractDataFromWebView(wv, username: clean, userID: userID) {
                 return result
             }
+            try? await Task.sleep(nanoseconds: 250_000_000)
         }
 
         return nil
     }
 
-    private func extractDataFromWebView(_ wv: WKWebView, username: String, userID: String) async -> String? {
-        // In callAsyncJavaScript, lo script è il corpo di una funzione async.
+    private func executeInPageFetch(_ wv: WKWebView, username: String, userID: String) async -> String? {
         let script = """
-        const uname = arguments[0].username.toLowerCase();
-        const uid = arguments[0].userId;
+        let uname = '';
+        if (typeof username !== 'undefined') uname = username;
+        else if (arguments[0] && typeof arguments[0] === 'object' && arguments[0].username) uname = arguments[0].username;
+        else if (arguments[0]) uname = arguments[0];
+        uname = String(uname || '').toLowerCase().replace(/@/g, '').trim();
 
-        // 🛡️ Protezione fondamentale anti-collisione: verifica che la WebView si trovi sul profilo dell'utente richiesto
-        const currentPath = window.location.pathname.toLowerCase().replace(/\\//g, '');
-        if (currentPath && currentPath !== uname && !currentPath.includes(uname)) {
-            return null; // La WebView sta ancora mostrando il profilo aperto in precedenza!
+        let uid = '';
+        if (typeof userId !== 'undefined') uid = userId;
+        else if (arguments[0] && typeof arguments[0] === 'object' && arguments[0].userId) uid = arguments[0].userId;
+        else if (arguments.length > 1 && arguments[1]) uid = arguments[1];
+        uid = String(uid || '').trim();
+
+        let csrf = (typeof csrfToken !== 'undefined' ? csrfToken : (arguments[0] && typeof arguments[0] === 'object' ? arguments[0].csrfToken : '')) || '';
+        if (!csrf) {
+            const m = document.cookie.match(/csrftoken=([^;]+)/);
+            if (m && m[1]) csrf = m[1];
+            if (!csrf && window._sharedData && window._sharedData.config) {
+                csrf = window._sharedData.config.csrf_token || '';
+            }
         }
 
-        // 1. Cerca nei tag script JSON (Relay/GraphQL data integrato da Instagram nella pagina)
-        const scripts = document.querySelectorAll('script[type="application/json"]');
-        for (const s of scripts) {
+        const headers = {
+            'x-ig-app-id': '936619743392459',
+            'x-asbd-id': '129477',
+            'x-csrftoken': csrf,
+            'x-requested-with': 'XMLHttpRequest',
+            'Accept': 'application/json, text/plain, */*'
+        };
+
+        // Prova 1: web_profile_info
+        if (uname && uname.length > 0) {
             try {
-                const txt = s.textContent || '';
-                if (txt.includes('edge_owner_to_timeline_media')) {
-                    const parsed = JSON.parse(txt);
-                    function findTimeline(obj) {
-                        if (!obj || typeof obj !== 'object') return null;
-                        if (obj.edge_owner_to_timeline_media && obj.edge_owner_to_timeline_media.edges && obj.edge_owner_to_timeline_media.edges.length > 0) {
-                            // Verifica che i dati appartengano effettivamente all'utente richiesto se username è presente
-                            if (obj.username && obj.username.toLowerCase() !== uname) {
-                                return null;
-                            }
-                            return obj;
-                        }
-                        for (const k in obj) {
-                            const found = findTimeline(obj[k]);
-                            if (found) return found;
-                        }
-                        return null;
-                    }
-                    const found = findTimeline(parsed);
-                    if (found) {
-                        return JSON.stringify({ data: { user: found } });
+                const res = await fetch('https://www.instagram.com/api/v1/users/web_profile_info/?username=' + encodeURIComponent(uname), {
+                    headers: headers,
+                    credentials: 'include'
+                });
+                if (res.ok) {
+                    const j = await res.json();
+                    if (j && (j.data || j.user)) {
+                        return JSON.stringify(j);
                     }
                 }
             } catch(e) {}
         }
 
-        // 2. Estrai elementi griglia dal DOM reale renderizzato (tag <a> e <img>)
-        const links = Array.from(document.querySelectorAll('a[href*="/p/"], a[href*="/reel/"]'));
-        const domPosts = [];
-        const seen = new Set();
-        for (const a of links) {
-            const href = a.getAttribute('href') || '';
-            const m = href.match(/\\/(p|reel)\\/([^\\/]+)/);
-            if (!m) continue;
-            const shortcode = m[2];
-            if (seen.has(shortcode)) continue;
-            seen.add(shortcode);
-
-            const img = a.querySelector('img');
-            if (!img || !img.src) continue;
-
-            const isVideo = a.querySelector('svg[aria-label*="Video"], svg[aria-label*="Clip"], svg[aria-label*="Reel"]') !== null;
-            const isCarousel = a.querySelector('svg[aria-label*="Carosello"], svg[aria-label*="Carousel"], svg[aria-label*="Post con più"]') !== null;
-
-            domPosts.push({
-                id: shortcode,
-                shortcode: shortcode,
-                media_type: isCarousel ? 8 : (isVideo ? 2 : 1),
-                display_url: img.src,
-                caption: img.alt || '',
-                like_count: 0
-            });
-        }
-
-        let profilePic = null;
-        const headerImg = document.querySelector('header img');
-        if (headerImg && headerImg.src) {
-            profilePic = headerImg.src;
-        }
-
-        const isPrivate = document.body.innerText.includes('Questo account è privato') || 
-                          document.body.innerText.includes('This Account is Private') ||
-                          document.body.innerText.includes('This account is private');
-
-        if (domPosts.length > 0) {
-            return JSON.stringify({
-                dom_posts: domPosts,
-                profile_pic_url: profilePic,
-                is_private: isPrivate
-            });
-        }
-
-        if (isPrivate) {
-            return JSON.stringify({
-                dom_posts: [],
-                profile_pic_url: profilePic,
-                is_private: true
-            });
-        }
-
-        // 3. Fallback: fetch in-page con referer locale esatto
-        try {
-            const res = await fetch('/api/v1/users/web_profile_info/?username=' + encodeURIComponent(uname), {
-                headers: {
-                    'x-ig-app-id': '936619743392459',
-                    'x-asbd-id': '129477',
-                    'x-requested-with': 'XMLHttpRequest',
-                    'Accept': 'application/json, text/plain, */*'
-                },
-                credentials: 'include'
-            });
-            if (res.ok) {
-                const j = await res.json();
-                if (j && (j.data || j.user)) {
-                    return JSON.stringify(j);
+        // Prova 2: feed utente per ID numerico se fornito
+        if (uid && /^[0-9]+$/.test(uid)) {
+            try {
+                const feedRes = await fetch('https://www.instagram.com/api/v1/feed/user/' + encodeURIComponent(uid) + '/?count=18', {
+                    headers: headers,
+                    credentials: 'include'
+                });
+                if (feedRes.ok) {
+                    const fj = await feedRes.json();
+                    if (fj && (fj.items || fj.data)) {
+                        return JSON.stringify(fj);
+                    }
                 }
+            } catch(e) {}
+        }
+        return null;
+        """
+
+        let effectiveCSRF = InstagramSessionManager.shared.currentSession?.csrfToken ?? ""
+        do {
+            let result = try await wv.callAsyncJavaScript(
+                script,
+                arguments: ["username": username, "userId": userID, "csrfToken": effectiveCSRF],
+                in: nil,
+                contentWorld: .page
+            )
+            if let jsonString = result as? String, !jsonString.isEmpty {
+                return jsonString
             }
-        } catch(e) {}
+        } catch {}
+
+        return nil
+    }
+
+    private func extractDataFromWebView(_ wv: WKWebView, username: String, userID: String) async -> String? {
+        let script = """
+        let uname = '';
+        if (typeof username !== 'undefined') uname = username;
+        else if (arguments[0] && typeof arguments[0] === 'object' && arguments[0].username) uname = arguments[0].username;
+        else if (arguments[0]) uname = arguments[0];
+        uname = String(uname || '').toLowerCase().replace(/@/g, '').trim();
+
+        let uid = '';
+        if (typeof userId !== 'undefined') uid = userId;
+        else if (arguments[0] && typeof arguments[0] === 'object' && arguments[0].userId) uid = arguments[0].userId;
+        else if (arguments.length > 1 && arguments[1]) uid = arguments[1];
+        uid = String(uid || '').trim();
+
+        let csrf = '';
+        const m = document.cookie.match(/csrftoken=([^;]+)/);
+        if (m && m[1]) csrf = m[1];
+        if (!csrf && window._sharedData && window._sharedData.config) {
+            csrf = window._sharedData.config.csrf_token || '';
+        }
+
+        const headers = {
+            'x-ig-app-id': '936619743392459',
+            'x-asbd-id': '129477',
+            'x-csrftoken': csrf,
+            'x-requested-with': 'XMLHttpRequest',
+            'Accept': 'application/json, text/plain, */*'
+        };
+
+        // 1. Priorità massima: fetch in-page autenticato con cookie WebKit e CSRF token
+        if (uname && uname.length > 0) {
+            try {
+                const res = await fetch('https://www.instagram.com/api/v1/users/web_profile_info/?username=' + encodeURIComponent(uname), {
+                    headers: headers,
+                    credentials: 'include'
+                });
+                if (res.ok) {
+                    const j = await res.json();
+                    if (j && (j.data || j.user)) {
+                        return JSON.stringify(j);
+                    }
+                }
+            } catch(e) {}
+        }
+
+        if (uid && /^[0-9]+$/.test(uid)) {
+            try {
+                const feedRes = await fetch('https://www.instagram.com/api/v1/feed/user/' + encodeURIComponent(uid) + '/?count=18', {
+                    headers: headers,
+                    credentials: 'include'
+                });
+                if (feedRes.ok) {
+                    const fj = await feedRes.json();
+                    if (fj && (fj.items || fj.data)) {
+                        return JSON.stringify(fj);
+                    }
+                }
+            } catch(e) {}
+        }
+
+        // 2. Controllo percorso: estrai da script Relay o DOM solo se la pagina corrisponde all'utente target
+        const currentPath = window.location.pathname.toLowerCase().replace(/\\//g, '');
+        const isTargetPage = currentPath === uname || currentPath.includes(uname);
+
+        if (isTargetPage) {
+            // Cerca nei tag script JSON (Relay/GraphQL data integrato da Instagram nella pagina)
+            const scripts = document.querySelectorAll('script[type="application/json"]');
+            for (const s of scripts) {
+                try {
+                    const txt = s.textContent || '';
+                    if (txt.includes('edge_owner_to_timeline_media')) {
+                        const parsed = JSON.parse(txt);
+                        function findTimeline(obj) {
+                            if (!obj || typeof obj !== 'object') return null;
+                            if (obj.edge_owner_to_timeline_media && obj.edge_owner_to_timeline_media.edges && obj.edge_owner_to_timeline_media.edges.length > 0) {
+                                if (obj.username && obj.username.toLowerCase() !== uname) {
+                                    return null;
+                                }
+                                return obj;
+                            }
+                            for (const k in obj) {
+                                const found = findTimeline(obj[k]);
+                                if (found) return found;
+                            }
+                            return null;
+                        }
+                        const found = findTimeline(parsed);
+                        if (found) {
+                            return JSON.stringify({ data: { user: found } });
+                        }
+                    }
+                } catch(e) {}
+            }
+
+            // Estrai elementi griglia dal DOM reale renderizzato (tag <a> e <img>)
+            const links = Array.from(document.querySelectorAll('a[href*="/p/"], a[href*="/reel/"], a[href*="/reels/"]'));
+            const domPosts = [];
+            const seen = new Set();
+            for (const a of links) {
+                const href = a.getAttribute('href') || '';
+                const m = href.match(/\\/(p|reel|reels)\\/([^\\/]+)/);
+                if (!m) continue;
+                const shortcode = m[2];
+                if (seen.has(shortcode)) continue;
+                seen.add(shortcode);
+
+                const img = a.querySelector('img');
+                const imgSrc = img ? (img.currentSrc || img.src || (img.srcset ? img.srcset.split(',').pop().trim().split(' ')[0] : '')) : '';
+                if (!imgSrc) continue;
+
+                const isVideo = a.querySelector('svg[aria-label*="Video"], svg[aria-label*="Clip"], svg[aria-label*="Reel"]') !== null;
+                const isCarousel = a.querySelector('svg[aria-label*="Carosello"], svg[aria-label*="Carousel"], svg[aria-label*="Post con più"]') !== null;
+
+                domPosts.push({
+                    id: shortcode,
+                    shortcode: shortcode,
+                    media_type: isCarousel ? 8 : (isVideo ? 2 : 1),
+                    display_url: imgSrc,
+                    caption: img ? (img.alt || '') : '',
+                    like_count: 0
+                });
+            }
+
+            let profilePic = null;
+            const headerImg = document.querySelector('header img');
+            if (headerImg) {
+                profilePic = headerImg.currentSrc || headerImg.src;
+            }
+
+            const isPrivate = document.body.innerText.includes('Questo account è privato') || 
+                              document.body.innerText.includes('This Account is Private') ||
+                              document.body.innerText.includes('This account is private');
+
+            if (domPosts.length > 0) {
+                return JSON.stringify({
+                    dom_posts: domPosts,
+                    profile_pic_url: profilePic,
+                    is_private: isPrivate
+                });
+            }
+
+            if (isPrivate) {
+                return JSON.stringify({
+                    dom_posts: [],
+                    profile_pic_url: profilePic,
+                    is_private: true
+                });
+            }
+        }
 
         return null;
         """
@@ -208,16 +365,31 @@ public final class InstagramWebBridge: NSObject, WKNavigationDelegate {
         prepare()
         guard let wv = webView else { return nil }
 
+        await waitForWebViewReady(wv, timeout: 2.0)
+
         let script = """
-        const uid = arguments[0].userId;
+        let uid = '';
+        if (typeof userId !== 'undefined') uid = userId;
+        else if (arguments[0] && typeof arguments[0] === 'object' && arguments[0].userId) uid = arguments[0].userId;
+        else if (arguments[0]) uid = arguments[0];
+        uid = String(uid || '').trim();
+
+        let csrf = '';
+        const m = document.cookie.match(/csrftoken=([^;]+)/);
+        if (m && m[1]) csrf = m[1];
+        if (!csrf && window._sharedData && window._sharedData.config) {
+            csrf = window._sharedData.config.csrf_token || '';
+        }
+
         const headers = {
             'x-ig-app-id': '936619743392459',
             'x-asbd-id': '129477',
+            'x-csrftoken': csrf,
             'x-requested-with': 'XMLHttpRequest',
             'Accept': 'application/json, text/plain, */*'
         };
         try {
-            const res = await fetch('/api/v1/feed/reels_media/?user_ids=' + encodeURIComponent(uid), {
+            const res = await fetch('https://www.instagram.com/api/v1/feed/reels_media/?user_ids=' + encodeURIComponent(uid), {
                 headers: headers,
                 credentials: 'include'
             });
@@ -251,11 +423,26 @@ public final class InstagramWebBridge: NSObject, WKNavigationDelegate {
         prepare()
         guard let wv = webView else { return nil }
 
+        await waitForWebViewReady(wv, timeout: 2.0)
+
         let script = """
-        const code = arguments[0].shortcode;
+        let code = '';
+        if (typeof shortcode !== 'undefined') code = shortcode;
+        else if (arguments[0] && typeof arguments[0] === 'object' && arguments[0].shortcode) code = arguments[0].shortcode;
+        else if (arguments[0]) code = arguments[0];
+        code = String(code || '').trim();
+
+        let csrf = '';
+        const m = document.cookie.match(/csrftoken=([^;]+)/);
+        if (m && m[1]) csrf = m[1];
+        if (!csrf && window._sharedData && window._sharedData.config) {
+            csrf = window._sharedData.config.csrf_token || '';
+        }
+
         const headers = {
             'x-ig-app-id': '936619743392459',
             'x-asbd-id': '129477',
+            'x-csrftoken': csrf,
             'x-requested-with': 'XMLHttpRequest',
             'Accept': 'application/json, text/plain, */*'
         };
@@ -276,7 +463,7 @@ public final class InstagramWebBridge: NSObject, WKNavigationDelegate {
         const numericId = /^[0-9]+$/.test(code) ? code : shortcodeToNumericID(code);
         if (numericId) {
             try {
-                const mediaRes = await fetch('/api/v1/media/' + numericId + '/info/', {
+                const mediaRes = await fetch('https://www.instagram.com/api/v1/media/' + numericId + '/info/', {
                     headers: headers,
                     credentials: 'include'
                 });
@@ -391,7 +578,12 @@ public final class InstagramWebBridge: NSObject, WKNavigationDelegate {
         guard let wv = webView else { return nil }
 
         let script = """
-        const existing = new Set(arguments[0].existing || []);
+        let ex = [];
+        if (typeof existing !== 'undefined') ex = existing;
+        else if (arguments[0] && typeof arguments[0] === 'object' && arguments[0].existing) ex = arguments[0].existing;
+        else if (arguments[0]) ex = arguments[0];
+        if (!Array.isArray(ex)) ex = [];
+        const existing = new Set(ex);
 
         // 1. Esegui scroll verso il basso combinato sia sul window che sul documento
         const scrollTarget = document.documentElement.scrollHeight || document.body.scrollHeight;
@@ -404,18 +596,19 @@ public final class InstagramWebBridge: NSObject, WKNavigationDelegate {
         await new Promise(r => setTimeout(r, 1200));
 
         // 2. Raccogli tutti i post presenti nel DOM non ancora salvati
-        const links = Array.from(document.querySelectorAll('a[href*="/p/"], a[href*="/reel/"]'));
+        const links = Array.from(document.querySelectorAll('a[href*="/p/"], a[href*="/reel/"], a[href*="/reels/"]'));
         const newPosts = [];
         for (const a of links) {
             const href = a.getAttribute('href') || '';
-            const m = href.match(/\\/(p|reel)\\/([^\\/]+)/);
+            const m = href.match(/\\/(p|reel|reels)\\/([^\\/]+)/);
             if (!m) continue;
             const shortcode = m[2];
             if (existing.has(shortcode)) continue;
             existing.add(shortcode);
 
             const img = a.querySelector('img');
-            if (!img || !img.src) continue;
+            const imgSrc = img ? (img.currentSrc || img.src || (img.srcset ? img.srcset.split(',').pop().trim().split(' ')[0] : '')) : '';
+            if (!imgSrc) continue;
 
             const isVideo = a.querySelector('svg[aria-label*="Video"], svg[aria-label*="Clip"], svg[aria-label*="Reel"]') !== null;
             const isCarousel = a.querySelector('svg[aria-label*="Carosello"], svg[aria-label*="Carousel"], svg[aria-label*="Post con più"]') !== null;
@@ -424,8 +617,8 @@ public final class InstagramWebBridge: NSObject, WKNavigationDelegate {
                 id: shortcode,
                 shortcode: shortcode,
                 media_type: isCarousel ? 8 : (isVideo ? 2 : 1),
-                display_url: img.src,
-                caption: img.alt || '',
+                display_url: imgSrc.replace(/&amp;/g, '&'),
+                caption: img ? (img.alt || '') : '',
                 like_count: 0
             });
         }
@@ -449,23 +642,77 @@ public final class InstagramWebBridge: NSObject, WKNavigationDelegate {
     }
 
     /// Recupera i dati del profilo dell'utente autenticato direttamente dal contesto WebKit
-    public func fetchCurrentUserProfile(userID: String) async -> String? {
-        guard !userID.isEmpty else { return nil }
+    public func fetchCurrentUserProfile(userID: String, username: String? = nil) async -> String? {
         prepare()
         guard let wv = webView else { return nil }
 
+        await waitForWebViewReady(wv, timeout: 3.5)
+
         let script = """
-        const uid = arguments[0].userId;
+        let uid = '';
+        if (typeof userId !== 'undefined') uid = userId;
+        else if (arguments[0] && typeof arguments[0] === 'object' && arguments[0].userId) uid = arguments[0].userId;
+        else if (arguments[0]) uid = arguments[0];
+        uid = String(uid || '').trim();
+
+        let uname = '';
+        if (typeof username !== 'undefined') uname = username;
+        else if (arguments[0] && typeof arguments[0] === 'object' && arguments[0].username) uname = arguments[0].username;
+        else if (arguments.length > 1 && arguments[1]) uname = arguments[1];
+        uname = String(uname || '').toLowerCase().replace(/@/g, '').trim();
+
+        let csrf = (typeof csrfToken !== 'undefined' ? csrfToken : (arguments[0] && typeof arguments[0] === 'object' ? arguments[0].csrfToken : '')) || '';
+        if (!csrf) {
+            const m = document.cookie.match(/csrftoken=([^;]+)/);
+            if (m && m[1]) csrf = m[1];
+            if (!csrf && window._sharedData && window._sharedData.config) {
+                csrf = window._sharedData.config.csrf_token || '';
+            }
+        }
+
         const headers = {
             'x-ig-app-id': '936619743392459',
             'x-asbd-id': '129477',
+            'x-csrftoken': csrf,
             'x-requested-with': 'XMLHttpRequest',
             'Accept': 'application/json, text/plain, */*'
         };
 
-        // Prova 1: endpoint info utente autenticato
+        // Prova 1: Se l'username è noto, web_profile_info restituisce il profilo completo con profile_pic_url_hd
+        if (uname && uname.length > 0) {
+            try {
+                const res = await fetch('https://www.instagram.com/api/v1/users/web_profile_info/?username=' + encodeURIComponent(uname), {
+                    headers: headers,
+                    credentials: 'include'
+                });
+                if (res.ok) {
+                    const j = await res.json();
+                    if (j && j.data && j.data.user) {
+                        return JSON.stringify(j.data.user);
+                    }
+                }
+            } catch(e) {}
+        }
+
+        // Prova 2: endpoint info utente autenticato (restituisce sempre profile_pic_url e hd_profile_pic_url_info)
+        if (uid && uid.length > 0) {
+            try {
+                const res = await fetch('https://www.instagram.com/api/v1/users/' + encodeURIComponent(uid) + '/info/', {
+                    headers: headers,
+                    credentials: 'include'
+                });
+                if (res.ok) {
+                    const j = await res.json();
+                    if (j && j.user) {
+                        return JSON.stringify(j.user);
+                    }
+                }
+            } catch(e) {}
+        }
+
+        // Prova 3: endpoint ufficiale web account autenticato
         try {
-            const res = await fetch('/api/v1/users/' + encodeURIComponent(uid) + '/info/', {
+            const res = await fetch('https://www.instagram.com/api/v1/accounts/current_user/?edit=true', {
                 headers: headers,
                 credentials: 'include'
             });
@@ -477,20 +724,89 @@ public final class InstagramWebBridge: NSObject, WKNavigationDelegate {
             }
         } catch(e) {}
 
-        // Prova 2: estrazione da window._sharedData
+        // Prova 4: endpoint form data (se ha username, prova subito web_profile_info per ottenere avatar)
+        try {
+            const res = await fetch('https://www.instagram.com/api/v1/accounts/edit/web_form_data/', {
+                headers: headers,
+                credentials: 'include'
+            });
+            if (res.ok) {
+                const j = await res.json();
+                const foundUname = j?.form_data?.username || j?.user?.username;
+                if (foundUname) {
+                    try {
+                        const profRes = await fetch('https://www.instagram.com/api/v1/users/web_profile_info/?username=' + encodeURIComponent(foundUname), {
+                            headers: headers,
+                            credentials: 'include'
+                        });
+                        if (profRes.ok) {
+                            const pj = await profRes.json();
+                            if (pj && pj.data && pj.data.user) {
+                                return JSON.stringify(pj.data.user);
+                            }
+                        }
+                    } catch(pe) {}
+                }
+                if (j && (j.user || j.form_data)) {
+                    return JSON.stringify(j.user || j.form_data);
+                }
+            }
+        } catch(e) {}
+
+        // Prova 5: estrazione da window._sharedData
         try {
             if (window._sharedData && window._sharedData.config && window._sharedData.config.viewer) {
                 return JSON.stringify(window._sharedData.config.viewer);
             }
         } catch(e) {}
 
+        // Prova 6: estrazione da script tag JSON Relay
+        try {
+            const scripts = document.querySelectorAll('script[type="application/json"]');
+            for (const s of scripts) {
+                const txt = s.textContent || '';
+                if (txt.includes('viewer') || txt.includes('"username"')) {
+                    const parsed = JSON.parse(txt);
+                    function findUser(obj) {
+                        if (!obj || typeof obj !== 'object') return null;
+                        if (obj.username && (obj.pk || obj.id)) {
+                            if (!uid || obj.pk === uid || obj.id === uid) return obj;
+                        }
+                        for (const k in obj) {
+                            const found = findUser(obj[k]);
+                            if (found) return found;
+                        }
+                        return null;
+                    }
+                    const found = findUser(parsed);
+                    if (found) return JSON.stringify(found);
+                }
+            }
+        } catch(e) {}
+
+        // Prova 7: estrazione avatar dal DOM dell'app web Instagram
+        try {
+            const avatarImg = document.querySelector('header img, nav img, img[alt*="profilo"], img[alt*="profile"], img[data-testid*="user-avatar"]');
+            if (avatarImg && (avatarImg.currentSrc || avatarImg.src)) {
+                const src = avatarImg.currentSrc || avatarImg.src;
+                if (src && !src.startsWith('data:')) {
+                    return JSON.stringify({
+                        username: uname || '',
+                        profile_pic_url_hd: src,
+                        profile_pic_url: src
+                    });
+                }
+            }
+        } catch(e) {}
+
         return null;
         """
 
+        let effectiveCSRF = InstagramSessionManager.shared.currentSession?.csrfToken ?? ""
         do {
             let result = try await wv.callAsyncJavaScript(
                 script,
-                arguments: ["userId": userID],
+                arguments: ["userId": userID, "username": username ?? "", "csrfToken": effectiveCSRF],
                 in: nil,
                 contentWorld: .page
             )

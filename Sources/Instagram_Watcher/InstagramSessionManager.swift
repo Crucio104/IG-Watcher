@@ -38,6 +38,7 @@ public final class InstagramSessionManager: ObservableObject {
 
     private let sessionKey = "com.instagramwatcher.session"
     private let profileKey = "com.instagramwatcher.user_profile"
+    private let usernameKey = "com.instagramwatcher.cached_username"
 
     @Published public private(set) var currentSession: InstagramSession?
     @Published public private(set) var currentUserProfile: InstagramUser?
@@ -50,22 +51,75 @@ public final class InstagramSessionManager: ObservableObject {
         loadSession()
     }
 
+    private var cachedCookieHeader: String = ""
+    private var lastCookieSync: Date = .distantPast
+
     /// Restituisce l'header cookie più recente estraendolo direttamente dallo store WebKit se disponibile
     public func getLiveCookieHeader() async -> String {
-        return await withCheckedContinuation { continuation in
-            WKWebsiteDataStore.default().httpCookieStore.getAllCookies { cookies in
-                let igCookies = cookies.filter { $0.domain.contains("instagram.com") }
-                for cookie in igCookies {
-                    HTTPCookieStorage.shared.setCookie(cookie)
-                }
-                if !igCookies.isEmpty {
-                    let header = igCookies.map { "\($0.name)=\($0.value)" }.joined(separator: "; ")
-                    continuation.resume(returning: header)
-                } else {
-                    continuation.resume(returning: self.currentSession?.cookieHeader ?? "")
+        let fallbackHeader = currentSession?.cookieHeader ?? ""
+
+        // Se abbiamo già sincronizzato i cookie reali negli ultimi 30 secondi, usa la cache
+        if !cachedCookieHeader.isEmpty && Date().timeIntervalSince(lastCookieSync) < 30 {
+            return cachedCookieHeader
+        }
+
+        // Interroga WKHTTPCookieStore in modo rigorosamente sicuro con timeout di salvaguardia
+        let result: String = await withCheckedContinuation { (continuation: CheckedContinuation<String, Never>) in
+            let lock = NSLock()
+            var hasResumed = false
+
+            let resumeOnce: (String) -> Void = { header in
+                lock.lock()
+                defer { lock.unlock() }
+                guard !hasResumed else { return }
+                hasResumed = true
+                continuation.resume(returning: header)
+            }
+
+            // Timeout di salvaguardia dopo 650ms: sblocca istantaneamente senza far attendere le API
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.65) {
+                resumeOnce(fallbackHeader)
+            }
+
+            DispatchQueue.main.async {
+                WKWebsiteDataStore.default().httpCookieStore.getAllCookies { cookies in
+                    let igCookies = cookies.filter { $0.domain.contains("instagram.com") }
+                    for cookie in igCookies {
+                        HTTPCookieStorage.shared.setCookie(cookie)
+                    }
+
+                    // Se il cookie contiene ds_user (il nickname reale), impostalo subito sul profilo se assente!
+                    if let dsUser = igCookies.first(where: { $0.name == "ds_user" })?.value, !dsUser.isEmpty {
+                        UserDefaults.standard.set(dsUser, forKey: self.usernameKey)
+                        if self.currentUserProfile == nil {
+                            let user = InstagramUser(
+                                id: self.currentSession?.userID ?? "",
+                                username: dsUser,
+                                fullName: "",
+                                profilePicURL: nil,
+                                isVerified: false
+                            )
+                            self.updateUserProfile(user)
+                        }
+                    }
+
+                    if !igCookies.isEmpty {
+                        let header = igCookies.map { "\($0.name)=\($0.value)" }.joined(separator: "; ")
+                        resumeOnce(header)
+                    } else {
+                        resumeOnce(fallbackHeader)
+                    }
                 }
             }
         }
+
+        if !result.isEmpty {
+            self.cachedCookieHeader = result
+            self.lastCookieSync = Date()
+            return result
+        }
+
+        return fallbackHeader
     }
 
     /// Salva la sessione estratta dopo il login completato in WKWebView
@@ -91,9 +145,31 @@ public final class InstagramSessionManager: ObservableObject {
 
     /// Aggiorna e salva il profilo utente connesso (username, nome, avatar)
     public func updateUserProfile(_ profile: InstagramUser) {
-        self.currentUserProfile = profile
-        if let encoded = try? JSONEncoder().encode(profile) {
-            UserDefaults.standard.set(encoded, forKey: profileKey)
+        if profile.profilePicURL == nil, let existingPic = self.currentUserProfile?.profilePicURL {
+            let merged = InstagramUser(
+                id: profile.id,
+                username: profile.username,
+                fullName: profile.fullName.isEmpty ? (self.currentUserProfile?.fullName ?? "") : profile.fullName,
+                profilePicURL: existingPic,
+                isVerified: profile.isVerified || (self.currentUserProfile?.isVerified ?? false),
+                isPrivate: profile.isPrivate,
+                mediaCount: profile.mediaCount ?? self.currentUserProfile?.mediaCount
+            )
+            self.currentUserProfile = merged
+            if !merged.username.isEmpty {
+                UserDefaults.standard.set(merged.username, forKey: usernameKey)
+            }
+            if let encoded = try? JSONEncoder().encode(merged) {
+                UserDefaults.standard.set(encoded, forKey: profileKey)
+            }
+        } else {
+            self.currentUserProfile = profile
+            if !profile.username.isEmpty {
+                UserDefaults.standard.set(profile.username, forKey: usernameKey)
+            }
+            if let encoded = try? JSONEncoder().encode(profile) {
+                UserDefaults.standard.set(encoded, forKey: profileKey)
+            }
         }
     }
 
@@ -107,6 +183,35 @@ public final class InstagramSessionManager: ObservableObject {
         if let profileData = UserDefaults.standard.data(forKey: profileKey),
            let profile = try? JSONDecoder().decode(InstagramUser.self, from: profileData) {
             self.currentUserProfile = profile
+        } else if let cachedUname = UserDefaults.standard.string(forKey: usernameKey), !cachedUname.isEmpty, let sid = self.currentSession?.userID {
+            self.currentUserProfile = InstagramUser(
+                id: sid,
+                username: cachedUname,
+                fullName: "",
+                profilePicURL: nil,
+                isVerified: false
+            )
+        }
+
+        // Se abbiamo una sessione ma il profilo non è ancora salvato, controlla subito i cookie WebKit per ds_user
+        if self.currentSession != nil && self.currentUserProfile == nil {
+            DispatchQueue.main.async { [weak self] in
+                WKWebsiteDataStore.default().httpCookieStore.getAllCookies { cookies in
+                    guard let self = self, self.currentUserProfile == nil else { return }
+                    let igCookies = cookies.filter { $0.domain.contains("instagram.com") }
+                    if let dsUser = igCookies.first(where: { $0.name == "ds_user" })?.value, !dsUser.isEmpty {
+                        UserDefaults.standard.set(dsUser, forKey: self.usernameKey)
+                        let user = InstagramUser(
+                            id: self.currentSession?.userID ?? "",
+                            username: dsUser,
+                            fullName: "",
+                            profilePicURL: nil,
+                            isVerified: false
+                        )
+                        self.updateUserProfile(user)
+                    }
+                }
+            }
         }
     }
 
@@ -114,6 +219,7 @@ public final class InstagramSessionManager: ObservableObject {
     public func logout() {
         UserDefaults.standard.removeObject(forKey: sessionKey)
         UserDefaults.standard.removeObject(forKey: profileKey)
+        UserDefaults.standard.removeObject(forKey: usernameKey)
         self.currentSession = nil
         self.currentUserProfile = nil
 

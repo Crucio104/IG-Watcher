@@ -24,71 +24,78 @@ public struct UserRowView: View {
     public var body: some View {
         let actionTitle = customActionTitle ?? loc("action.view_profile")
         HStack(spacing: 12) {
-            // Immagine profilo con ring colorato in stile Story
-            ZStack {
-                Circle()
-                    .stroke(
-                        Theme.instagramGradient,
-                        lineWidth: 2
-                    )
-                    .frame(width: 48, height: 48)
-
-                AsyncImage(url: user.profilePicURL) { phase in
-                    switch phase {
-                    case .empty:
+            // Immagine profilo e dati anagrafici (Tap per aprire il visualizzatore anonimo)
+            Button {
+                showingMediaViewer = true
+            } label: {
+                HStack(spacing: 12) {
+                    ZStack {
                         Circle()
-                            .fill(Color(UIColor.tertiarySystemFill))
-                            .frame(width: 42, height: 42)
-                            .overlay(ProgressView().scaleEffect(0.6))
-                    case .success(let image):
-                        image
-                            .resizable()
-                            .scaledToFill()
-                            .frame(width: 42, height: 42)
-                            .clipShape(Circle())
-                    case .failure:
-                        Circle()
-                            .fill(Color(UIColor.tertiarySystemFill))
-                            .frame(width: 42, height: 42)
-                            .overlay(
-                                Image(systemName: "person.fill")
-                                    .font(.system(size: 18))
-                                    .foregroundColor(.secondary)
+                            .stroke(
+                                Theme.instagramGradient,
+                                lineWidth: 2
                             )
-                    @unknown default:
-                        EmptyView()
+                            .frame(width: 48, height: 48)
+
+                        AsyncImage(url: user.profilePicURL) { phase in
+                            switch phase {
+                            case .empty:
+                                Circle()
+                                    .fill(Color(UIColor.tertiarySystemFill))
+                                    .frame(width: 42, height: 42)
+                                    .overlay(ProgressView().scaleEffect(0.6))
+                            case .success(let image):
+                                image
+                                    .resizable()
+                                    .scaledToFill()
+                                    .frame(width: 42, height: 42)
+                                    .clipShape(Circle())
+                            case .failure:
+                                Circle()
+                                    .fill(Color(UIColor.tertiarySystemFill))
+                                    .frame(width: 42, height: 42)
+                                    .overlay(
+                                        Image(systemName: "person.fill")
+                                            .font(.system(size: 18))
+                                            .foregroundColor(.secondary)
+                                    )
+                            @unknown default:
+                                EmptyView()
+                            }
+                        }
+                    }
+
+                    // Dati anagrafici utente
+                    VStack(alignment: .leading, spacing: 3) {
+                        HStack(spacing: 5) {
+                            Text(user.username)
+                                .font(.system(size: 15, weight: .semibold))
+                                .foregroundColor(.primary)
+                                .lineLimit(1)
+
+                            if user.isVerified {
+                                Image(systemName: "checkmark.seal.fill")
+                                    .foregroundColor(.blue)
+                                    .font(.system(size: 12))
+                            }
+
+                            if user.isPrivate {
+                                Image(systemName: "lock.fill")
+                                    .foregroundColor(.secondary)
+                                    .font(.system(size: 11))
+                            }
+                        }
+
+                        if !user.fullName.isEmpty {
+                            Text(user.fullName)
+                                .font(.system(size: 13))
+                                .foregroundColor(.secondary)
+                                .lineLimit(1)
+                        }
                     }
                 }
             }
-
-            // Dati anagrafici utente
-            VStack(alignment: .leading, spacing: 3) {
-                HStack(spacing: 5) {
-                    Text(user.username)
-                        .font(.system(size: 15, weight: .semibold))
-                        .foregroundColor(.primary)
-                        .lineLimit(1)
-
-                    if user.isVerified {
-                        Image(systemName: "checkmark.seal.fill")
-                            .foregroundColor(.blue)
-                            .font(.system(size: 12))
-                    }
-
-                    if user.isPrivate {
-                        Image(systemName: "lock.fill")
-                            .foregroundColor(.secondary)
-                            .font(.system(size: 11))
-                    }
-                }
-
-                if !user.fullName.isEmpty {
-                    Text(user.fullName)
-                        .font(.system(size: 13))
-                        .foregroundColor(.secondary)
-                        .lineLimit(1)
-                }
-            }
+            .buttonStyle(PlainButtonStyle())
 
             Spacer(minLength: 8)
 

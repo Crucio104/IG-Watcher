@@ -76,6 +76,7 @@ struct InstagramLoginWebView: UIViewRepresentable {
                 var dsUserID: String?
                 var sessionID: String?
                 var csrfToken: String?
+                var dsUser: String?
 
                 for cookie in cookies {
                     if cookie.name == "ds_user_id" {
@@ -84,6 +85,8 @@ struct InstagramLoginWebView: UIViewRepresentable {
                         sessionID = cookie.value
                     } else if cookie.name == "csrftoken" {
                         csrfToken = cookie.value
+                    } else if cookie.name == "ds_user" {
+                        dsUser = cookie.value
                     }
                 }
 
@@ -109,6 +112,10 @@ struct InstagramLoginWebView: UIViewRepresentable {
                                 userAgent: authenticUA,
                                 rawCookieHeader: rawCookieHeader
                             )
+                            if let u = dsUser, !u.isEmpty {
+                                let initialUser = InstagramUser(id: uid, username: u)
+                                InstagramSessionManager.shared.updateUserProfile(initialUser)
+                            }
                             let session = InstagramSession(
                                 userID: uid,
                                 sessionID: sid,
@@ -119,6 +126,22 @@ struct InstagramLoginWebView: UIViewRepresentable {
 
                             // Risolve e salva subito il profilo per mostrare nickname e avatar senza ritardi
                             if let profile = try? await InstagramAPIService.shared.fetchCurrentUserProfile(session: session) {
+                                InstagramSessionManager.shared.updateUserProfile(profile)
+                            } else if let jsonString = await InstagramWebBridge.shared.fetchCurrentUserProfile(userID: session.userID),
+                                      let data = jsonString.data(using: .utf8),
+                                      let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+                                      let uname = json["username"] as? String, !uname.isEmpty {
+                                let fullName = (json["full_name"] as? String) ?? ""
+                                let isVerified = (json["is_verified"] as? Bool) ?? false
+                                let picURLStr = (json["profile_pic_url"] as? String)
+                                let picURL = picURLStr != nil ? URL(string: picURLStr!) : nil
+                                let profile = InstagramUser(
+                                    id: session.userID,
+                                    username: uname,
+                                    fullName: fullName,
+                                    profilePicURL: picURL,
+                                    isVerified: isVerified
+                                )
                                 InstagramSessionManager.shared.updateUserProfile(profile)
                             }
 

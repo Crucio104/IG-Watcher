@@ -33,26 +33,49 @@ public final class InstagramAPIService: Sendable {
     private init() {}
 
     /// Recupera i dettagli del profilo dell'utente autenticato (username, nome, avatar)
-    public func fetchCurrentUserProfile(session: InstagramSession) async throws -> InstagramUser {
+    public func fetchCurrentUserProfile(session: InstagramSession, username: String? = nil) async throws -> InstagramUser {
         let liveCookies = await InstagramSessionManager.shared.getLiveCookieHeader()
-        let endpoints = [
-            "https://www.instagram.com/api/v1/users/\(session.userID)/info/",
-            "https://i.instagram.com/api/v1/users/\(session.userID)/info/"
-        ]
+        let finalCookie = liveCookies.isEmpty ? session.cookieHeader : liveCookies
+        var effectiveCSRF = session.csrfToken
+        for part in finalCookie.components(separatedBy: ";") {
+            let pair = part.trimmingCharacters(in: .whitespaces).components(separatedBy: "=")
+            if pair.count >= 2 && pair[0] == "csrftoken" {
+                let token = pair.dropFirst().joined(separator: "=")
+                if !token.isEmpty { effectiveCSRF = token; break }
+            }
+        }
+
+        var endpoints: [String] = []
+        if let u = username?.trimmingCharacters(in: .whitespacesAndNewlines).replacingOccurrences(of: "@", with: ""), !u.isEmpty {
+            endpoints.append("https://www.instagram.com/api/v1/users/web_profile_info/?username=\(u)")
+            endpoints.append("https://i.instagram.com/api/v1/users/web_profile_info/?username=\(u)")
+        }
+        // Priorità massima agli endpoint che includono SEMPRE l'avatar HD
+        endpoints.append("https://www.instagram.com/api/v1/users/\(session.userID)/info/")
+        endpoints.append("https://i.instagram.com/api/v1/users/\(session.userID)/info/")
+        endpoints.append("https://www.instagram.com/api/v1/accounts/current_user/?edit=true")
+        endpoints.append("https://www.instagram.com/api/v1/accounts/edit/web_form_data/")
 
         let lastError: Error = InstagramAPIError.invalidResponse
+        var fallbackUserWithoutAvatar: InstagramUser? = nil
 
         for urlStr in endpoints {
             guard let url = URL(string: urlStr) else { continue }
             var request = URLRequest(url: url)
             request.httpMethod = "GET"
-            request.setValue(liveCookies.isEmpty ? session.cookieHeader : liveCookies, forHTTPHeaderField: "Cookie")
-            request.setValue(session.csrfToken, forHTTPHeaderField: "x-csrftoken")
+            request.httpShouldHandleCookies = true
+            request.setValue(finalCookie, forHTTPHeaderField: "Cookie")
+            if !effectiveCSRF.isEmpty {
+                request.setValue(effectiveCSRF, forHTTPHeaderField: "x-csrftoken")
+            }
             request.setValue("936619743392459", forHTTPHeaderField: "x-ig-app-id")
             request.setValue("129477", forHTTPHeaderField: "x-asbd-id")
             request.setValue("XMLHttpRequest", forHTTPHeaderField: "x-requested-with")
             request.setValue(session.userAgent, forHTTPHeaderField: "User-Agent")
-            request.setValue("https://www.instagram.com/", forHTTPHeaderField: "Referer")
+            
+            let refererUser = username?.trimmingCharacters(in: .whitespacesAndNewlines).replacingOccurrences(of: "@", with: "") ?? ""
+            let referer = refererUser.isEmpty ? "https://www.instagram.com/" : "https://www.instagram.com/\(refererUser)/"
+            request.setValue(referer, forHTTPHeaderField: "Referer")
             request.setValue("same-origin", forHTTPHeaderField: "Sec-Fetch-Site")
             request.setValue("cors", forHTTPHeaderField: "Sec-Fetch-Mode")
             request.setValue("empty", forHTTPHeaderField: "Sec-Fetch-Dest")
@@ -60,26 +83,52 @@ public final class InstagramAPIService: Sendable {
 
             guard let (data, response) = try? await URLSession.shared.data(for: request),
                   let httpResponse = response as? HTTPURLResponse, (200...299).contains(httpResponse.statusCode),
-                  let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-                  let userDict = json["user"] as? [String: Any],
-                  let username = userDict["username"] as? String else {
+                  let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
                 continue
             }
 
-            let fullName = userDict["full_name"] as? String ?? ""
-            let isVerified = userDict["is_verified"] as? Bool ?? false
-            let isPrivate = userDict["is_private"] as? Bool ?? false
-            let picURLString = userDict["profile_pic_url"] as? String
-            let picURL = picURLString != nil ? URL(string: picURLString!) : nil
+            let userDict: [String: Any]? = (json["user"] as? [String: Any]) ??
+                                           (json["form_data"] as? [String: Any]) ??
+                                           ((json["data"] as? [String: Any])?["user"] as? [String: Any])
 
-            return InstagramUser(
+            guard let dict = userDict, let uname = dict["username"] as? String, !uname.isEmpty else {
+                continue
+            }
+
+            let fullName = (dict["full_name"] as? String) ?? (dict["first_name"] as? String) ?? ""
+            let isVerified = dict["is_verified"] as? Bool ?? false
+            let isPrivate = dict["is_private"] as? Bool ?? false
+            
+            // Estrae l'avatar HD controllando tutte le strutture possibili di Instagram
+            let rawPicURL = (dict["profile_pic_url_hd"] as? String) ??
+                            (dict["profile_pic_url"] as? String) ??
+                            ((dict["hd_profile_pic_url_info"] as? [String: Any])?["url"] as? String) ??
+                            (((dict["hd_profile_pic_versions"] as? [[String: Any]])?.first)?["url"] as? String) ??
+                            (dict["profile_picture"] as? String)
+            let picURL = rawPicURL.flatMap { URL(string: $0.trimmingCharacters(in: .whitespacesAndNewlines).replacingOccurrences(of: "&amp;", with: "&")) }
+
+            let candidate = InstagramUser(
                 id: session.userID,
-                username: username,
+                username: uname,
                 fullName: fullName,
                 profilePicURL: picURL,
                 isVerified: isVerified,
                 isPrivate: isPrivate
             )
+
+            // Se abbiamo ottenuto sia username che avatar, abbiamo il profilo perfetto: restituiscilo subito!
+            if picURL != nil {
+                return candidate
+            }
+
+            // Altrimenti memorizza come fallback temporaneo e continua a cercare un endpoint con avatar
+            if fallbackUserWithoutAvatar == nil {
+                fallbackUserWithoutAvatar = candidate
+            }
+        }
+
+        if let fallback = fallbackUserWithoutAvatar {
+            return fallback
         }
 
         throw lastError
@@ -144,10 +193,24 @@ public final class InstagramAPIService: Sendable {
 
             guard let url = urlComponents.url else { break }
 
+            let liveCookies = await InstagramSessionManager.shared.getLiveCookieHeader()
+            let finalCookie = liveCookies.isEmpty ? session.cookieHeader : liveCookies
+            var effectiveCSRF = session.csrfToken
+            for part in finalCookie.components(separatedBy: ";") {
+                let pair = part.trimmingCharacters(in: .whitespaces).components(separatedBy: "=")
+                if pair.count >= 2 && pair[0] == "csrftoken" {
+                    let token = pair.dropFirst().joined(separator: "=")
+                    if !token.isEmpty { effectiveCSRF = token; break }
+                }
+            }
+
             var request = URLRequest(url: url)
             request.httpMethod = "GET"
-            request.setValue(session.cookieHeader, forHTTPHeaderField: "Cookie")
-            request.setValue(session.csrfToken, forHTTPHeaderField: "x-csrftoken")
+            request.httpShouldHandleCookies = true
+            request.setValue(finalCookie, forHTTPHeaderField: "Cookie")
+            if !effectiveCSRF.isEmpty {
+                request.setValue(effectiveCSRF, forHTTPHeaderField: "x-csrftoken")
+            }
             request.setValue("936619743392459", forHTTPHeaderField: "x-ig-app-id")
             request.setValue("129477", forHTTPHeaderField: "x-asbd-id")
             request.setValue("XMLHttpRequest", forHTTPHeaderField: "x-requested-with")

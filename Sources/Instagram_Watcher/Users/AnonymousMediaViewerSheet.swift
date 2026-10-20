@@ -464,6 +464,25 @@ public struct AnonymousMediaViewerSheet: View {
                         .foregroundColor(.secondary)
                         .multilineTextAlignment(.center)
                         .padding(.horizontal, 36)
+
+                    Button {
+                        Task {
+                            await loadProfileData()
+                        }
+                    } label: {
+                        HStack(spacing: 6) {
+                            Image(systemName: "arrow.clockwise")
+                                .font(.system(size: 12, weight: .bold))
+                            Text(loc("status.update_now"))
+                                .font(.system(size: 13, weight: .semibold))
+                        }
+                        .padding(.horizontal, 16)
+                        .padding(.vertical, 8)
+                        .background(Color.blue.opacity(0.12))
+                        .foregroundColor(.blue)
+                        .clipShape(Capsule())
+                    }
+                    .padding(.top, 8)
                 }
             } else {
                 LazyVGrid(
@@ -700,7 +719,13 @@ public struct AnonymousMediaViewerSheet: View {
         let (loadedStories, loadedPosts) = await (fetchedStories, fetchedPosts)
         self.stories = loadedStories
         if !loadedPosts.isEmpty {
-            self.posts = loadedPosts
+            var combined = self.posts
+            for p in loadedPosts {
+                if !combined.contains(where: { $0.id == p.id }) {
+                    combined.append(p)
+                }
+            }
+            self.posts = combined.isEmpty ? loadedPosts : combined
         }
 
         self.isLoading = false
